@@ -1,0 +1,42 @@
+# ESP-IDF Configuration Defaults for "Conductor - Smart Zigbee Console for Logitech z906"
+# Target: ESP32-C6-DevKitC-1 (8MB Physical Flash)
+
+# Route system console to USB Serial/JTAG to leave hardware UART0 and UART1 free for Z906
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# Serial Flash Configuration (8MB, DIO mode, 80MHz)
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHMODE="dio"
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHFREQ="80m"
+
+# Custom Partition Table for A/B Native Zigbee OTA (8MB Flash)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# Application Rollback Support in Bootloader & App Update
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_APP_ROLLBACK_ENABLE=y
+
+# FreeRTOS 1000 Hz tick rate for precise 1ms timing resolution
+CONFIG_FREERTOS_HZ=1000
+
+# FreeRTOS Run Time Stats for lightweight O(1) CPU load measurement
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER=y
+
+# Task Watchdog Timer
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+
+# ESP Zigbee SDK v2.x Configuration (IEEE 802.15.4 Native Radio Router)
+CONFIG_ZB_ENABLED=y
+CONFIG_ZB_RADIO_NATIVE=y
+CONFIG_ZB_ZCZR=y
+# Explicitly disable v1.x backward compatibility layer (pure v2 native architecture)
+CONFIG_ZB_SDK_1xx=n
+CONFIG_ZB_DEBUG_MODE=n

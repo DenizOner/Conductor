@@ -1,0 +1,337 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Logitech Z906 Central Command Registry Metadata",
+  "description": "Single Source of Truth for all Logitech Z906 control commands across CLI, Zigbee 3.0, and Zigbee2MQTT External Converter.",
+  "version": "1.0.0",
+  "commands": [
+    {
+      "id": 0,
+      "enum_id": "Z906_CMD_ID_POWER",
+      "name": "power",
+      "description": "Power state control (Standby / ON)",
+      "param": {
+        "type": "boolean",
+        "min": 0,
+        "max": 1,
+        "labels": ["off", "on"]
+      },
+      "cli": {
+        "command": "power",
+        "usage": "power <on|off>",
+        "arg_type": "string_enum",
+        "allowed_args": ["on", "off"]
+      },
+      "zigbee": {
+        "endpoint": 1,
+        "cluster_id": "0x0006",
+        "cluster_name": "genOnOff",
+        "attr_id": "0x0000",
+        "attr_name": "onOff",
+        "data_type": "bool"
+      },
+      "converter": {
+        "expose_name": "state",
+        "expose_type": "switch",
+        "access": "STATE_SET",
+        "endpoint": "main"
+      },
+      "verifier": {
+        "verify_type": "VERIFY_CMD_POWER",
+        "verifiable": true,
+        "is_relative": false,
+        "is_toggle": false
+      }
+    },
+    {
+      "id": 1,
+      "enum_id": "Z906_CMD_ID_VOLUME",
+      "name": "volume",
+      "description": "Master volume control in discrete Z906 steps (0-43)",
+      "param": {
+        "type": "integer",
+        "min": 0,
+        "max": 43
+      },
+      "cli": {
+        "command": "volume",
+        "usage": "volume <0-43>",
+        "arg_type": "integer"
+      },
+      "zigbee": {
+        "endpoint": 1,
+        "cluster_id": "0x0008",
+        "cluster_name": "genLevelCtrl",
+        "attr_id": "0x0000",
+        "attr_name": "currentLevel",
+        "data_type": "uint8",
+        "scaling": "zcl_254_to_43"
+      },
+      "converter": {
+        "expose_name": "volume",
+        "expose_type": "numeric",
+        "min": 0,
+        "max": 43,
+        "access": "ALL",
+        "endpoint": "main"
+      },
+      "verifier": {
+        "verify_type": "VERIFY_CMD_VOLUME",
+        "verifiable": true,
+        "is_relative": false,
+        "is_toggle": false
+      }
+    },
+    {
+      "id": 2,
+      "enum_id": "Z906_CMD_ID_MUTE",
+      "name": "mute",
+      "description": "Amplifier audio mute toggle",
+      "param": {
+        "type": "boolean",
+        "min": 0,
+        "max": 1,
+        "labels": ["off", "on"]
+      },
+      "cli": {
+        "command": "mute",
+        "usage": "mute <on|off>",
+        "arg_type": "string_enum",
+        "allowed_args": ["on", "off"]
+      },
+      "zigbee": {
+        "endpoint": 2,
+        "cluster_id": "0xFC01",
+        "cluster_name": "z906Trims",
+        "attr_id": "0x0003",
+        "attr_name": "audioMute",
+        "data_type": "bool"
+      },
+      "converter": {
+        "expose_name": "mute",
+        "expose_type": "binary",
+        "access": "ALL",
+        "endpoint": "main"
+      },
+      "verifier": {
+        "verify_type": "VERIFY_CMD_MUTE",
+        "verifiable": true,
+        "is_relative": false,
+        "is_toggle": false
+      }
+    },
+    {
+      "id": 3,
+      "enum_id": "Z906_CMD_ID_INPUT",
+      "name": "input",
+      "description": "Audio input source selection (1=6-Channel Direct, 2=RCA Stereo, 3=Optical 1, 4=Optical 2, 5=Digital Coaxial, 6=Auxiliary/AUX)",
+      "param": {
+        "type": "integer",
+        "min": 1,
+        "max": 6,
+        "labels": [
+          "6-Channel Direct (Input 1)",
+          "RCA Stereo (Input 2)",
+          "Optical 1 (Input 3)",
+          "Optical 2 (Input 4)",
+          "Digital Coaxial (Input 5)",
+          "Auxiliary / AUX (Input 6)"
+        ]
+      },
+      "cli": {
+        "command": "input",
+        "usage": "input <1-6>",
+        "arg_type": "integer"
+      },
+      "zigbee": {
+        "endpoint": 3,
+        "cluster_id": "0xFC02",
+        "cluster_name": "z906Sources",
+        "attr_id": "0x0000",
+        "attr_name": "sourceInput",
+        "data_type": "uint8"
+      },
+      "converter": {
+        "expose_name": "input",
+        "expose_type": "enum",
+        "values": [
+          "6-Channel Direct (Input 1)",
+          "RCA Stereo (Input 2)",
+          "Optical 1 (Input 3)",
+          "Optical 2 (Input 4)",
+          "Digital Coaxial (Input 5)",
+          "Auxiliary / AUX (Input 6)"
+        ],
+        "access": "ALL",
+        "endpoint": "sources"
+      },
+      "verifier": {
+        "verify_type": "VERIFY_CMD_INPUT",
+        "verifiable": true,
+        "is_relative": false,
+        "is_toggle": false
+      }
+    },
+    {
+      "id": 4,
+      "enum_id": "Z906_CMD_ID_EFFECT",
+      "name": "effect",
+      "description": "Spatial audio processing effect selection",
+      "param": {
+        "type": "integer",
+        "min": 0,
+        "max": 3,
+        "labels": ["3D", "2.1", "4.1", "None"]
+      },
+      "cli": {
+        "command": "effect",
+        "usage": "effect <3d|2.1|4.1|none>",
+        "arg_type": "string_enum",
+        "allowed_args": ["3d", "2.1", "4.1", "none"]
+      },
+      "zigbee": {
+        "endpoint": 3,
+        "cluster_id": "0xFC02",
+        "cluster_name": "z906Sources",
+        "attr_id": "0x0001",
+        "attr_name": "sourceEffect",
+        "data_type": "uint8"
+      },
+      "converter": {
+        "expose_name": "effect",
+        "expose_type": "enum",
+        "values": ["3D", "2.1", "4.1", "None"],
+        "access": "ALL",
+        "endpoint": "sources"
+      },
+      "verifier": {
+        "verify_type": "VERIFY_CMD_EFFECT",
+        "verifiable": true,
+        "is_relative": false,
+        "is_toggle": false
+      }
+    },
+    {
+      "id": 5,
+      "enum_id": "Z906_CMD_ID_TRIM_BASS",
+      "name": "trim_bass",
+      "description": "Subwoofer bass channel level (0-43)",
+      "param": {
+        "type": "integer",
+        "min": 0,
+        "max": 43
+      },
+      "cli": {
+        "command": "trim bass",
+        "usage": "trim bass <0-43>",
+        "arg_type": "integer",
+        "subcommand": "bass"
+      },
+      "zigbee": {
+        "endpoint": 2,
+        "cluster_id": "0xFC01",
+        "cluster_name": "z906Trims",
+        "attr_id": "0x0000",
+        "attr_name": "trimBass",
+        "data_type": "uint8",
+        "scaling": "zcl_254_to_43"
+      },
+      "converter": {
+        "expose_name": "trim_bass",
+        "expose_type": "numeric",
+        "min": 0,
+        "max": 43,
+        "access": "ALL",
+        "endpoint": "trims"
+      },
+      "verifier": {
+        "verify_type": "VERIFY_CMD_TRIM",
+        "channel": "TRIM_CHANNEL_BASS",
+        "verifiable": true,
+        "is_relative": false,
+        "is_toggle": false
+      }
+    },
+    {
+      "id": 6,
+      "enum_id": "Z906_CMD_ID_TRIM_CENTER",
+      "name": "trim_center",
+      "description": "Center speaker channel level (0-43)",
+      "param": {
+        "type": "integer",
+        "min": 0,
+        "max": 43
+      },
+      "cli": {
+        "command": "trim center",
+        "usage": "trim center <0-43>",
+        "arg_type": "integer",
+        "subcommand": "center"
+      },
+      "zigbee": {
+        "endpoint": 2,
+        "cluster_id": "0xFC01",
+        "cluster_name": "z906Trims",
+        "attr_id": "0x0001",
+        "attr_name": "trimCenter",
+        "data_type": "uint8",
+        "scaling": "zcl_254_to_43"
+      },
+      "converter": {
+        "expose_name": "trim_center",
+        "expose_type": "numeric",
+        "min": 0,
+        "max": 43,
+        "access": "ALL",
+        "endpoint": "trims"
+      },
+      "verifier": {
+        "verify_type": "VERIFY_CMD_TRIM",
+        "channel": "TRIM_CHANNEL_CENTER",
+        "verifiable": true,
+        "is_relative": false,
+        "is_toggle": false
+      }
+    },
+    {
+      "id": 7,
+      "enum_id": "Z906_CMD_ID_TRIM_REAR",
+      "name": "trim_rear",
+      "description": "Rear surround speakers level (0-43)",
+      "param": {
+        "type": "integer",
+        "min": 0,
+        "max": 43
+      },
+      "cli": {
+        "command": "trim rear",
+        "usage": "trim rear <0-43>",
+        "arg_type": "integer",
+        "subcommand": "rear"
+      },
+      "zigbee": {
+        "endpoint": 2,
+        "cluster_id": "0xFC01",
+        "cluster_name": "z906Trims",
+        "attr_id": "0x0002",
+        "attr_name": "trimRear",
+        "data_type": "uint8",
+        "scaling": "zcl_254_to_43"
+      },
+      "converter": {
+        "expose_name": "trim_rear",
+        "expose_type": "numeric",
+        "min": 0,
+        "max": 43,
+        "access": "ALL",
+        "endpoint": "trims"
+      },
+      "verifier": {
+        "verify_type": "VERIFY_CMD_TRIM",
+        "channel": "TRIM_CHANNEL_REAR",
+        "verifiable": true,
+        "is_relative": false,
+        "is_toggle": false
+      }
+    }
+  ]
+}

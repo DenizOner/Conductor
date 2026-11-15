@@ -1,0 +1,39 @@
+{
+  "servers": {
+    "esp-idf-tools": {
+      "type": "stdio",
+      "command": "C:\\Users\\deniz\\AppData\\Local\\Programs\\Espressif\\EIM\\eim.exe",
+      "args": [
+        "run",
+        "idf.py mcp-server"
+      ],
+      "env": {
+        "IDF_MCP_WORKSPACE_FOLDER": "${workspaceFolder}"
+      }
+    },
+    "espressif-documentation": {
+      "type": "http",
+      "url": "https://mcp.espressif.com/docs"
+    },
+    "rainmaker": {
+      "type": "http",
+      "url": "https://mcp.rainmaker.espressif.com/api/mcp"
+    },
+    "esp-component-registry": {
+      "type": "http",
+      "url": "https://components.espressif.com/mcp"
+    },
+    "esp-vision": {
+      "type": "http",
+      "url": "https://mcp.vision.espressif.com"
+    },
+    "espressif-engineering": {
+      "type": "http",
+      "url": "https://ts-mcp.espressif.com/mcp"
+    },
+    "esp-pilot-mcp": {
+      "type": "http",
+      "url": "https://mcp.esp-pilot.espressif.com/mcp"
+    }
+  }
+}

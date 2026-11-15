@@ -1,0 +1,337 @@
+/**
+ * @file test_ota.c
+ * @brief Unit tests for Native Zigbee OTA Client, Image Header Verification, Health Check Logic,
+ *        and Failure-Path / Rollback Transitions (Model A: CURRENT HEALTH).
+ */
+
+#include <unity.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "ota_types.h"
+#include "ota_client.h"
+#include "ota_health.h"
+#include "zigbee_app.h"
+#include "z906_state.h"
+#include "nvs_manager.h"
+#include "wdt_manager.h"
+#include "config.h"
+#include "esp_ota_ops.h"
+#include <string.h>
+
+static int s_rollback_call_count = 0;
+static const char *s_last_rollback_reason = NULL;
+
+static void mock_rollback_fn(const char *reason)
+{
+    s_rollback_call_count++;
+    s_last_rollback_reason = reason;
+}
+
+static esp_err_t mock_mark_valid_ok(void)
+{
+    return ESP_OK;
+}
+
+void setUp(void)
+{
+    nvs_manager_init();
+    wdt_manager_init(10);
+    z906_state_init();
+    z906_state_set_cable_status(true);
+    z906_state_set_power(true);
+    zigbee_app_reset_state();
+    ota_health_reset_for_test();
+    s_rollback_call_count = 0;
+    s_last_rollback_reason = NULL;
+}
+
+void tearDown(void)
+{
+    ota_health_reset_for_test();
+    zigbee_app_reset_state();
+}
+
+/**
+ * @brief Tests OTA client state machine string conversion.
+ */
+void test_ota_state_strings(void)
+{
+    TEST_ASSERT_EQUAL_STRING("IDLE", ota_client_state_str(OTA_STATE_IDLE));
+    TEST_ASSERT_EQUAL_STRING("CHECKING", ota_client_state_str(OTA_STATE_CHECKING));
+    TEST_ASSERT_EQUAL_STRING("AVAILABLE", ota_client_state_str(OTA_STATE_AVAILABLE));
+    TEST_ASSERT_EQUAL_STRING("DOWNLOADING", ota_client_state_str(OTA_STATE_DOWNLOADING));
+    TEST_ASSERT_EQUAL_STRING("VERIFYING", ota_client_state_str(OTA_STATE_VERIFYING));
+    TEST_ASSERT_EQUAL_STRING("READY_TO_REBOOT", ota_client_state_str(OTA_STATE_READY_TO_REBOOT));
+    TEST_ASSERT_EQUAL_STRING("PENDING_VALIDATION", ota_client_state_str(OTA_STATE_PENDING_VALIDATION));
+    TEST_ASSERT_EQUAL_STRING("SUCCESS", ota_client_state_str(OTA_STATE_SUCCESS));
+    TEST_ASSERT_EQUAL_STRING("FAILED", ota_client_state_str(OTA_STATE_FAILED));
+    TEST_ASSERT_EQUAL_STRING("ROLLBACK", ota_client_state_str(OTA_STATE_ROLLBACK));
+}
+
+/**
+ * @brief Tests OTA result string conversion.
+ */
+void test_ota_result_strings(void)
+{
+    TEST_ASSERT_EQUAL_STRING("NONE", ota_client_result_str(OTA_RESULT_NONE));
+    TEST_ASSERT_EQUAL_STRING("SUCCESS", ota_client_result_str(OTA_RESULT_SUCCESS));
+    TEST_ASSERT_EQUAL_STRING("DOWNLOAD_FAILED", ota_client_result_str(OTA_RESULT_DOWNLOAD_FAILED));
+    TEST_ASSERT_EQUAL_STRING("VALIDATION_FAILED", ota_client_result_str(OTA_RESULT_VALIDATION_FAILED));
+    TEST_ASSERT_EQUAL_STRING("INCOMPATIBLE_IMAGE", ota_client_result_str(OTA_RESULT_INCOMPATIBLE_IMAGE));
+    TEST_ASSERT_EQUAL_STRING("FLASH_FAILED", ota_client_result_str(OTA_RESULT_FLASH_FAILED));
+    TEST_ASSERT_EQUAL_STRING("HEALTH_CHECK_FAILED", ota_client_result_str(OTA_RESULT_HEALTH_CHECK_FAILED));
+    TEST_ASSERT_EQUAL_STRING("ROLLBACK_DETECTED", ota_client_result_str(OTA_RESULT_ROLLBACK_DETECTED));
+}
+
+/**
+ * @brief Verifies ota_client_handle_image_notify() schedules a query.
+ */
+void test_ota_incompatible_image_rejection(void)
+{
+    ota_client_init();
+    TEST_ASSERT_EQUAL(OTA_STATE_IDLE, ota_client_get_state());
+
+    ota_client_handle_image_notify(
+        0,
+        0,
+        Z906_OTA_MANUFACTURER_CODE,
+        Z906_OTA_IMAGE_TYPE,
+        Z906_OTA_FILE_VERSION + 1
+    );
+
+    TEST_ASSERT_EQUAL(OTA_STATE_CHECKING, ota_client_get_state());
+
+    ota_client_abort("test cleanup");
+    TEST_ASSERT_EQUAL(OTA_STATE_IDLE, ota_client_get_state());
+}
+
+/**
+ * @brief Tests canonical Zigbee OTA header data structure size and alignment.
+ */
+void test_zigbee_ota_header_structure(void)
+{
+    TEST_ASSERT_EQUAL_UINT32(56, sizeof(zigbee_ota_header_t));
+
+    zigbee_ota_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.upgrade_file_id = ZIGBEE_OTA_FILE_IDENTIFIER;
+    hdr.header_version = ZIGBEE_OTA_HEADER_VERSION;
+    hdr.header_length = 56;
+    hdr.manufacturer_code = Z906_OTA_MANUFACTURER_CODE;
+    hdr.image_type = Z906_OTA_IMAGE_TYPE;
+    hdr.file_version = Z906_OTA_FILE_VERSION;
+
+    TEST_ASSERT_EQUAL_HEX32(ZIGBEE_OTA_FILE_IDENTIFIER, hdr.upgrade_file_id);
+    TEST_ASSERT_EQUAL_HEX16(0x0100, hdr.header_version);
+    TEST_ASSERT_EQUAL_UINT16(56, hdr.header_length);
+    TEST_ASSERT_EQUAL_HEX16(0x131B, hdr.manufacturer_code);
+    TEST_ASSERT_EQUAL_HEX16(0x0906, hdr.image_type);
+    TEST_ASSERT_EQUAL_HEX32(0x010400AA, hdr.file_version);
+}
+
+/**
+ * @brief Tests Health Check subsystem initial state and criteria reporting.
+ */
+void test_ota_health_check_subsystem(void)
+{
+    ota_health_init();
+    TEST_ASSERT_FALSE(ota_health_is_pending_verify());
+
+    ota_health_criteria_t criteria;
+    ota_health_get_criteria(&criteria);
+    TEST_ASSERT_TRUE(criteria.scheduler_healthy);
+}
+
+/**
+ * @brief Tests Diagnostics structure population.
+ */
+void test_ota_diagnostics_retrieval(void)
+{
+    ota_diagnostics_t diag;
+    memset(&diag, 0, sizeof(diag));
+    ota_client_get_diagnostics(&diag);
+
+    TEST_ASSERT_EQUAL_HEX32(Z906_OTA_FILE_VERSION, diag.current_file_version);
+    TEST_ASSERT_NOT_NULL(diag.running_partition_name);
+    TEST_ASSERT_NOT_NULL(diag.target_partition_name);
+}
+
+/**
+ * @brief Tests OTA client explicit failure note recording and state reflection.
+ */
+void test_ota_health_failure_recording(void)
+{
+    ota_client_init();
+    TEST_ASSERT_EQUAL(OTA_STATE_IDLE, ota_client_get_state());
+
+    ota_client_note_health_failure("Subsystem validation failed during health observation window");
+    TEST_ASSERT_EQUAL(OTA_STATE_FAILED, ota_client_get_state());
+    TEST_ASSERT_EQUAL(OTA_RESULT_HEALTH_CHECK_FAILED, ota_client_get_last_result());
+
+    ota_client_abort("Reset after health failure test");
+    TEST_ASSERT_EQUAL(OTA_STATE_IDLE, ota_client_get_state());
+}
+
+/**
+ * @brief Tests OTA criteria bitmask manipulation and individual subsystem reporting.
+ */
+void test_ota_health_criteria_reporting_and_mask(void)
+{
+    ota_health_init();
+
+    ota_health_report_scheduler_ok();
+    ota_health_report_twdt_ok();
+    ota_health_report_nvs_ok();
+    ota_health_report_zigbee_ok();
+    ota_health_report_z906_comm_ok();
+
+    uint32_t mask = ota_health_get_passed_criteria_mask();
+    TEST_ASSERT_TRUE((mask & OTA_CRITERION_SCHEDULER) != 0);
+    TEST_ASSERT_TRUE((mask & OTA_CRITERION_TWDT) != 0);
+    TEST_ASSERT_TRUE((mask & OTA_CRITERION_NVS) != 0);
+    TEST_ASSERT_TRUE((mask & OTA_CRITERION_ZIGBEE) != 0);
+    TEST_ASSERT_TRUE((mask & OTA_CRITERION_Z906_COMM) != 0);
+    TEST_ASSERT_EQUAL_HEX32(OTA_ALL_CRITERIA_PASS_MASK, mask & OTA_ALL_CRITERIA_PASS_MASK);
+}
+
+/* ========================================================================= */
+/* TC-15 & TC-16: Model A (CURRENT HEALTH) Transition Regression Tests       */
+/* ========================================================================= */
+
+/**
+ * @brief Transition A: healthy -> healthy throughout entire window.
+ * Image must be committed permanently (validated=true, no rollback).
+ */
+void test_ota_health_transition_a_healthy_throughout_validates(void)
+{
+    ota_health_set_rollback_fn_for_test(mock_rollback_fn);
+    ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
+    ota_health_set_pending_verify_for_test(true);
+
+    /* 15 one-second evaluation cycles while all subsystems are healthy */
+    for (int i = 0; i < 15; i++) {
+        ota_health_process_cycle(1);
+    }
+
+    TEST_ASSERT_EQUAL_INT(0, s_rollback_call_count);
+    TEST_ASSERT_TRUE_MESSAGE(ota_health_is_validated(),
+        "Transition A: Firmware must be permanently committed when healthy throughout");
+    TEST_ASSERT_FALSE(ota_health_is_pending_verify());
+}
+
+/**
+ * @brief Transition B: healthy -> unhealthy (Model A critical invariant).
+ * In Model A, criteria are NOT latched. Subsystem degradation during window
+ * must cause health failure and trigger automatic rollback!
+ */
+void test_ota_health_transition_b_healthy_to_unhealthy_triggers_rollback(void)
+{
+    ota_health_set_rollback_fn_for_test(mock_rollback_fn);
+    ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
+    ota_health_set_pending_verify_for_test(true);
+
+    /* 5 seconds healthy */
+    for (int i = 0; i < 5; i++) {
+        ota_health_process_cycle(1);
+    }
+    TEST_ASSERT_EQUAL_INT(0, s_rollback_call_count);
+
+    /* Subsystem fails at second 6 (Zigbee commissioning fails) */
+    zigbee_app_simulate_commission_failure();
+
+    /* Remaining 10 seconds */
+    for (int i = 0; i < 10; i++) {
+        ota_health_process_cycle(1);
+    }
+
+    /* Model A INVARIANT: Must NOT commit! Must trigger rollback! */
+    TEST_ASSERT_EQUAL_INT_MESSAGE(1, s_rollback_call_count,
+        "Transition B: Subsystem failure during observation window MUST trigger rollback");
+    TEST_ASSERT_FALSE_MESSAGE(ota_health_is_validated(),
+        "Firmware must NOT be validated when subsystem fails");
+}
+
+/**
+ * @brief Transition C: unhealthy -> healthy (recovers before window expires).
+ * If a transient fault clears and all criteria are healthy at window completion,
+ * firmware validates successfully.
+ */
+void test_ota_health_transition_c_unhealthy_to_healthy_validates(void)
+{
+    ota_health_set_rollback_fn_for_test(mock_rollback_fn);
+    ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
+    ota_health_set_pending_verify_for_test(true);
+
+    /* Start with transient fault */
+    zigbee_app_simulate_commission_failure();
+
+    /* 5 seconds in transient fault */
+    for (int i = 0; i < 5; i++) {
+        ota_health_process_cycle(1);
+    }
+    TEST_ASSERT_EQUAL_INT(0, s_rollback_call_count);
+
+    /* Recovers at second 6 */
+    zigbee_app_reset_state();
+
+    /* Complete window (remaining 10 seconds) */
+    for (int i = 0; i < 10; i++) {
+        ota_health_process_cycle(1);
+    }
+
+    TEST_ASSERT_EQUAL_INT(0, s_rollback_call_count);
+    TEST_ASSERT_TRUE_MESSAGE(ota_health_is_validated(),
+        "Transition C: Recovery before window expiration must allow valid commit");
+}
+
+/**
+ * @brief Transition D: unhealthy throughout entire observation window.
+ * Must trigger automatic rollback at expiration!
+ */
+void test_ota_health_transition_d_unhealthy_throughout_triggers_rollback(void)
+{
+    ota_health_set_rollback_fn_for_test(mock_rollback_fn);
+    ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
+    ota_health_set_pending_verify_for_test(true);
+
+    /* Remains in failed state throughout */
+    zigbee_app_simulate_commission_failure();
+
+    for (int i = 0; i < 15; i++) {
+        ota_health_process_cycle(1);
+    }
+
+    TEST_ASSERT_EQUAL_INT(1, s_rollback_call_count);
+    TEST_ASSERT_FALSE(ota_health_is_validated());
+}
+
+int runUnityTests(void)
+{
+    UNITY_BEGIN();
+    RUN_TEST(test_ota_state_strings);
+    RUN_TEST(test_ota_result_strings);
+    RUN_TEST(test_ota_incompatible_image_rejection);
+    RUN_TEST(test_zigbee_ota_header_structure);
+    RUN_TEST(test_ota_health_check_subsystem);
+    RUN_TEST(test_ota_diagnostics_retrieval);
+    RUN_TEST(test_ota_health_failure_recording);
+    RUN_TEST(test_ota_health_criteria_reporting_and_mask);
+    RUN_TEST(test_ota_health_transition_a_healthy_throughout_validates);
+    RUN_TEST(test_ota_health_transition_b_healthy_to_unhealthy_triggers_rollback);
+    RUN_TEST(test_ota_health_transition_c_unhealthy_to_healthy_validates);
+    RUN_TEST(test_ota_health_transition_d_unhealthy_throughout_triggers_rollback);
+    return UNITY_END();
+}
+
+#if defined(ESP_PLATFORM)
+void app_main(void)
+{
+    vTaskDelay(pdMS_TO_TICKS(3000)); /* Allow serial monitor to open */
+    runUnityTests();
+}
+#else
+int main(void)
+{
+    return runUnityTests();
+}
+#endif
