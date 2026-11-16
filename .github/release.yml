@@ -1,0 +1,25 @@
+changelog:
+  categories:
+    - title: "🚀 Features & Enhancements"
+      labels:
+        - "enhancement"
+        - "feature"
+    - title: "🐛 Bug Fixes"
+      labels:
+        - "bug"
+        - "fix"
+    - title: "🔒 Security & Hardening"
+      labels:
+        - "security"
+        - "dependencies"
+    - title: "⚡ CI/CD & Build Infrastructure"
+      labels:
+        - "ci/cd"
+    - title: "📚 Documentation"
+      labels:
+        - "documentation"
+  exclude:
+    labels:
+      - "duplicate"
+      - "invalid"
+      - "wontfix"

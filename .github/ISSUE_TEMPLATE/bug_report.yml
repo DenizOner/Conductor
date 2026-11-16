@@ -1,0 +1,78 @@
+name: Bug Report
+description: Create a bug report to help improve Conductor firmware or tools.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting an issue! Please do NOT report security vulnerabilities here; use [Private Vulnerability Reporting](https://github.com/DenizOner/Conductor/security/advisories/new) instead.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+      placeholder: Describe what happened...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component Affected
+      options:
+        - "Zigbee 3.0 Stack / Clusters"
+        - "Logitech Z906 Protocol / Codec"
+        - "Command Verifier / State Manager"
+        - "UART Transport / HAL"
+        - "Zigbee2MQTT External Converter"
+        - "OTA Firmware Upgrade"
+        - "CLI Console / Developer Tools"
+        - "Build System / CI Pipeline"
+        - "Other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: How can maintainers reproduce the issue?
+      placeholder: |
+        1. Power on device with...
+        2. Send Zigbee command...
+        3. Observe telemetry...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment & Hardware Setup
+      description: Hardware board, firmware version, coordinator, Zigbee2MQTT / Home Assistant version.
+      placeholder: |
+        - Board: ESP32-C6-DevKitC-1 (8MB Flash)
+        - Firmware Version: v1.4.0
+        - Zigbee Coordinator: Sonoff Dongle-E / SLZB-06
+        - Zigbee2MQTT Version: ...
+        - Logitech Z906 Hardware Revision: ...
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Serial Logs / Debug Output
+      description: Paste relevant serial log output from USB-JTAG or Zigbee2MQTT debug log.
+      render: shell
+    validations:
+      required: false
