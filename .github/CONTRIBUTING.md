@@ -2,7 +2,7 @@
 
 Thank you for your interest in contributing to **Conductor — Smart Zigbee Console for Logitech Z906**!
 
-Before making contributions, please review our core directives and architectural principles documented in [AGENTS.md](AGENTS.md) and [CODEBASE.md](CODEBASE.md).
+Before making contributions, please review our core directives and architectural principles documented in [AGENTS.md](../AGENTS.md) and [CODEBASE.md](../CODEBASE.md).
 
 ---
 
@@ -11,6 +11,7 @@ Before making contributions, please review our core directives and architectural
 - **Inspect Before Acting:** Always examine the existing directory structure, header interfaces, and configuration files before modifying code.
 - **Zero Assumptions Policy:** Never make assumptions about hardware pinouts, peripheral registers, or communication protocols. Every technical detail must be verified.
 - **Strict Relative Paths:** All file paths, references, and documentation links must originate from the project root.
+- **Root Directory Hygiene:** Adhere strictly to AGENTS.md §19.1. Do not add non-canonical files to the repository root.
 - **No Scope Creep:** Keep pull requests focused, concise, and targeted.
 - **Documentation & Test Sync:** Keep `CODEBASE.md`, relevant test suites, and in-line code comments synchronized with every code modification.
 
@@ -20,7 +21,7 @@ Before making contributions, please review our core directives and architectural
 
 ### 2.1 Branching Strategy
 
-- `main` is protected: Direct pushes and force pushes are strictly prohibited.
+- `main` is protected: Direct pushes and force pushes are strictly prohibited by repository rulesets.
 - Always branch off `main` using descriptive branch names:
   - `feat/feature-name`
   - `fix/bug-fix-name`
@@ -44,7 +45,7 @@ pio run -e esp32-c6-devkitc-1
 
 1. Open a pull request against `main` using the provided PR template.
 2. Ensure all automated CI checks pass (`Host Automated Validators`, `Build Firmware Binary & Validate OTA`, `CodeQL`, `Dependency Review`).
-3. Resolve all conversations and reviewer comments.
+3. Resolve all review conversation threads.
 4. Linear git history is enforced: Merges must be squash merges or rebase merges.
 
 ---

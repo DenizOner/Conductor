@@ -38,5 +38,5 @@ Only the latest release on the `main` branch is actively supported with security
 - **Zero Dynamic Allocation at Runtime:** All tasks, queues, buffers, and protocol frames use deterministic static allocation to eliminate heap fragmentation and use-after-free vulnerabilities.
 - **Task Watchdog Protection:** Core FreeRTOS tasks are supervised by the ESP32-C6 Task Watchdog Timer (TWDT).
 - **Physical Hardware State Verification:** System commands strictly route through `z906_cmd_verifier` to prevent unverified optimistic state reporting.
-- **OTA Cryptographic Integrity:** Zigbee OTA images require matching file IDs, manufacturer codes, and SHA-512 digest verification before flashing.
-- **Actions & Supply Chain:** Workflows run with least-privilege permissions (`contents: read`) and release binaries are signed with GitHub Artifact Attestations.
+- **OTA Verification & Cryptographic Integrity:** Zigbee OTA images require matching canonical File ID (`0x0BEEF11E`), header version (`0x0100`), manufacturer code (`0x131B`), image type (`0x0906`), and anti-downgrade version validation on firmware (`src/management/ota/ota_zigbee_transport.c`), complemented by SHA-512 integrity verification by the Zigbee2MQTT coordinator index prior to OTA transmission.
+- **Actions & Supply Chain:** Workflows run with least-privilege permissions (`contents: read`), action dependencies are pinned to immutable commit SHAs, and release binaries are signed with GitHub Artifact Attestations.
