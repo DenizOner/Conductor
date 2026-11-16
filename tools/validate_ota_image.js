@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const ZIGBEE_OTA_FILE_IDENTIFIER = 0x0BEF11E0;
+const ZIGBEE_OTA_FILE_IDENTIFIER = 0x0BEEF11E;
 const EXPECTED_MFR_CODE = 0x131B;
 const EXPECTED_IMAGE_TYPE = 0x0906;
 const EXPECTED_FILE_VERSION = 0x010400AA;
