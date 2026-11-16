@@ -64,9 +64,14 @@ jobs:
 
       - name: Generate Zigbee2MQTT index.json & SHA-512
         run: |
-          RELEASE_TAG=${GITHUB_REF#refs/tags/}
-          [ "$RELEASE_TAG" = "refs/heads/main" ] && RELEASE_TAG="v1.4.0"
           OTA_FILENAME="1000-0906-010400aa-LogitechZ906.ota"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            RELEASE_TAG="${GITHUB_REF#refs/tags/}"
+          else
+            # Manual workflow_dispatch on a branch (dry-run/validation):
+            # Fall back to canonical target firmware version (v1.4.0) instead of producing malformed refs/heads/... URLs
+            RELEASE_TAG="v1.4.0"
+          fi
           RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}/${OTA_FILENAME}"
           node tools/generate_ota_index.js dist/${OTA_FILENAME} "${RELEASE_URL}" dist/index.json
 

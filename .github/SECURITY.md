@@ -20,18 +20,19 @@ Instead, please submit a vulnerability report through GitHub's **Private Vulnera
 
 ### Response & Handling Process
 
-- **Acknowledgement:** We will acknowledge receipt of your vulnerability report within 48 hours.
-- **Assessment:** We will confirm the issue, determine its severity (CVSS), and formulate a mitigation plan.
-- **Remediation & Advisory:** Once a patch is developed and verified against hardware test benches, a coordinated security advisory and patched firmware release will be published.
+- **Acknowledgement:** We aim to acknowledge receipt of your vulnerability report as promptly as possible on a best-effort basis (typically within 48 to 72 hours).
+- **Assessment:** We will confirm the issue, evaluate its severity, and formulate a mitigation plan.
+- **Remediation & Advisory:** Once a patch is developed and verified against hardware/host test suites, a coordinated security advisory and patched firmware release will be published.
 
 ## Supported Versions
 
-Only the latest release on the `main` branch is actively supported with security updates.
+Conductor is currently in active development. Security patches and updates are provided for the latest tagged production release and the active `main` branch.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| >= 1.4  | :white_check_mark: |
-| < 1.4   | :x:                |
+| Version / Target | Supported          | Notes                                     |
+| ---------------- | ------------------ | ----------------------------------------- |
+| Latest Tagged Release | :white_check_mark: | Actively supported with security updates  |
+| `main` (current development) | :white_check_mark: | Active development branch                 |
+| Historical / Untagged commits | :x:                | Not maintained; upgrade to latest release |
 
 ## Security Architecture & Best Practices
 
