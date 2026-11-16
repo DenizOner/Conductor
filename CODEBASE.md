@@ -149,12 +149,31 @@ Every path listed below is relative to the project root and reflects the verifie
 
 ```text
 .
+├── .github/                        # GitHub Actions CI/CD workflows, community standards & issue forms
+│   ├── CODEOWNERS                  # Primary maintainer ownership mapping
+│   ├── CODE_OF_CONDUCT.md          # Contributor Covenant Code of Conduct v2.1
+│   ├── CONTRIBUTING.md             # Developer contribution guidelines and PR lifecycle
+│   ├── SECURITY.md                 # Security policy & Private Vulnerability Reporting instructions
+│   ├── dependabot.yml              # Dependabot configuration (github-actions & pip schedules)
+│   ├── release.yml                 # Automated release notes changelog categories
+│   ├── requirements.txt            # Pinned build-time Python dependencies (platformio==6.1.16)
+│   ├── ISSUE_TEMPLATE/             # Structured GitHub Issue forms
+│   │   ├── bug_report.yml          # Bug report form with component classification
+│   │   ├── config.yml              # Security redirection & discussions contact links
+│   │   └── feature_request.yml     # Feature enhancement request form
+│   ├── PULL_REQUEST_TEMPLATE.md    # Standard PR checklist & hardware verification notes
+│   └── workflows/                  # GitHub Actions workflow definitions
+│       ├── ci.yml                  # PR & push CI pipeline (host validators, PlatformIO build, dependency review)
+│       └── release_ota.yml         # Tagged release pipeline (build, package, attest provenance, publish)
 ├── .gitignore                      # Git ignore rules for build artifacts and IDE cache
 ├── AGENTS.md                       # AI coding agent development guidelines and living documentation rules
 ├── CODEBASE.md                     # Living technical documentation of architecture and system specification
 ├── CMakeLists.txt                  # Root CMake project configuration for ESP-IDF
-├── README.md                       # Primary project documentation, hardware specs, and quickstart guide
+├── dependencies.lock               # Espressif IDF component manager lockfile
+├── eim_config.toml                 # ESP-IDF Image Manager partition configuration
+├── partitions.csv                  # Dual OTA partition table (ota_0 / ota_1 1792 KB slots)
 ├── platformio.ini                  # PlatformIO configuration (esp32-c6-devkitc-1, espidf framework)
+├── README.md                       # Primary project documentation, hardware specs, and quickstart guide
 ├── sdkconfig.defaults              # Default ESP-IDF configuration (USB-JTAG console, 8MB flash @ 80MHz DIO)
 ├── sdkconfig.esp32-c6-devkitc-1    # Generated target-specific SDK configuration cache
 ├── include/                        # Public configuration headers
