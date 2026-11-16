@@ -13,6 +13,8 @@
 #include "z906_cmd_verifier.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "ota_health.h"
+#include "ota_client.h"
 #include <string.h>
 
 static const char *TAG = "TELEMETRY";
@@ -127,6 +129,16 @@ void telemetry_process_cycle(void)
         }
     }
 
+    /* During pending OTA verification, obtain a fresh CONFIG frame inside
+     * the 15-second window (normal STATUS polling is around 20 seconds).
+     * Keep the existing verifier lock and user-command priority; retry on BUSY. */
+    if (ota_health_is_pending_verify() && !z906_state_is_main_valid()) {
+        if (s_pending_query_id < 0) {
+            (void)telemetry_dispatch_query(Z906_CMD_READ_STATUS);
+        }
+        return;
+    }
+
     /* 3. Execute non-interfering sequential telemetry polling every 5 seconds (5 * 1000ms ticks) */
     s_cycle_counter++;
     if (s_cycle_counter < 5) {
@@ -194,7 +206,6 @@ void telemetry_audit_stack_usage(TaskHandle_t task, const char *task_name)
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "wdt_manager.h"
-#include "ota_health.h"
 
 /** @brief Stack depth in words for the telemetry polling task */
 #define TELEMETRY_TASK_STACK_WORDS    (2048u / sizeof(StackType_t))
@@ -244,6 +255,9 @@ static void prv_telemetry_task(void *pvParameters)
             ota_health_report_twdt_ok();
             twdt_reported = true;
         }
+
+        /* Single runtime owner of the pending-image health evaluation. */
+        ota_client_process_cycle();
 
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
