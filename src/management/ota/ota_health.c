@@ -15,6 +15,7 @@
 #include "zigbee_native_stack.h"
 #include "zigbee_device_model.h"
 #include "esp_timer.h"
+#include <string.h>
 #include "z906_state.h"
 #include "led_notification_manager.h"
 
