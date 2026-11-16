@@ -39,6 +39,11 @@ esp_err_t esp_ota_mark_app_invalid_rollback_and_reboot(void);
 #define ESP_LOGW(tag, fmt, ...) do { (void)(tag); fprintf(stderr, fmt "\\n", ##__VA_ARGS__); } while (0)
 #define ESP_LOGE(tag, fmt, ...) do { (void)(tag); fprintf(stderr, fmt "\\n", ##__VA_ARGS__); } while (0)
 """,
+    "esp_timer.h": """
+#pragma once
+#include <stdint.h>
+int64_t esp_timer_get_time(void);
+""",
     "esp_system.h": """
 #pragma once
 void esp_restart(void);
