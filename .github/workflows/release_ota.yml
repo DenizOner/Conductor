@@ -7,12 +7,21 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  build-and-release-ota:
+  build-and-package:
     name: Build Firmware & Package Zigbee OTA
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
 
     steps:
       - name: Check out repository
@@ -34,7 +43,7 @@ jobs:
       - name: Install PlatformIO Core
         run: |
           python -m pip install --upgrade pip
-          pip install platformio
+          pip install -r requirements.txt
 
       - name: Run Host Automated Validators
         run: |
@@ -63,9 +72,49 @@ jobs:
       - name: Validate Generated OTA Container & Index
         run: |
           node tools/validate_ota_image.js dist/1000-0906-010400aa-LogitechZ906.ota dist/index.json
+          node tools/test_ota_package.js
 
-      - name: Create GitHub Release and Upload Artifacts
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Prepare Release Artifacts Directory
+        run: |
+          mkdir -p release_assets
+          cp .pio/build/esp32-c6-devkitc-1/firmware.bin release_assets/
+          cp dist/1000-0906-010400aa-LogitechZ906.ota release_assets/
+          cp dist/index.json release_assets/
+          cp tools/conductor_converter.mjs release_assets/
+
+      - name: Attest Build Provenance for Release Assets
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            release_assets/firmware.bin
+            release_assets/1000-0906-010400aa-LogitechZ906.ota
+            release_assets/index.json
+            release_assets/conductor_converter.mjs
+
+      - name: Upload Release Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: release_assets/
+          retention-days: 7
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: build-and-package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Release Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release_assets/
+
+      - name: Create GitHub Release and Upload Verified Artifacts
         uses: softprops/action-gh-release@v2
         with:
           name: "Release ${{ github.ref_name }} — Native Zigbee OTA Upgrade"
@@ -73,7 +122,7 @@ jobs:
           prerelease: false
           generate_release_notes: true
           files: |
-            .pio/build/esp32-c6-devkitc-1/firmware.bin
-            dist/1000-0906-010400aa-LogitechZ906.ota
-            dist/index.json
-            tools/logitech_z906_converter.js
+            release_assets/firmware.bin
+            release_assets/1000-0906-010400aa-LogitechZ906.ota
+            release_assets/index.json
+            release_assets/conductor_converter.mjs
