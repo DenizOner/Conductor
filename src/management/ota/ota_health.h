@@ -45,7 +45,7 @@ bool ota_health_init(void);
  * If all criteria pass, commits firmware with esp_ota_mark_app_valid_cancel_rollback().
  * If any fatal criteria fail or timeout expires with unfulfilled criteria,
  * executes automatic rollback with esp_ota_mark_app_invalid_rollback_and_reboot().
- * @param elapsed_sec Seconds elapsed since last cycle.
+ * @param elapsed_sec Legacy caller hint; real time is measured by esp_timer_get_time().
  */
 void ota_health_process_cycle(uint32_t elapsed_sec);
 
@@ -116,7 +116,13 @@ bool ota_health_is_validated(void);
 typedef void (*ota_rollback_fn_t)(const char *reason);
 typedef esp_err_t (*ota_mark_valid_fn_t)(void);
 
+typedef int64_t (*ota_health_time_fn_t)(void);
+typedef bool (*ota_health_bool_fn_t)(void);
+
 void ota_health_set_pending_verify_for_test(bool pending);
+void ota_health_set_time_fn_for_test(ota_health_time_fn_t fn);
+void ota_health_set_zigbee_ready_fn_for_test(ota_health_bool_fn_t fn);
+void ota_health_set_fallback_available_fn_for_test(ota_health_bool_fn_t fn);
 void ota_health_set_rollback_fn_for_test(ota_rollback_fn_t fn);
 void ota_health_set_mark_valid_fn_for_test(ota_mark_valid_fn_t fn);
 void ota_health_reset_for_test(void);

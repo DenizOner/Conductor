@@ -12,7 +12,9 @@
 #include "freertos/task.h"
 #include "wdt_manager.h"
 #include "nvs_manager.h"
-#include "zigbee_app.h"
+#include "zigbee_native_stack.h"
+#include "zigbee_device_model.h"
+#include "esp_timer.h"
 #include "z906_state.h"
 #include "led_notification_manager.h"
 
@@ -24,11 +26,21 @@ static bool s_is_pending_verify = false;
 static bool s_rollback_detected = false;
 static bool s_is_validated = false;
 static uint32_t s_seconds_in_validation = 0;
+static int64_t s_validation_start_us = 0;
+static bool s_rollback_handled = false;
 static uint32_t s_passed_criteria_mask = 0;
 static ota_health_criteria_t s_criteria = { 0 };
 
 static ota_rollback_fn_t s_rollback_fn_for_test = NULL;
 static ota_mark_valid_fn_t s_mark_valid_fn_for_test = NULL;
+static ota_health_time_fn_t s_time_fn_for_test = NULL;
+static ota_health_bool_fn_t s_zigbee_ready_fn_for_test = NULL;
+static ota_health_bool_fn_t s_fallback_available_fn_for_test = NULL;
+
+static int64_t ota_health_now_us(void)
+{
+    return s_time_fn_for_test != NULL ? s_time_fn_for_test() : esp_timer_get_time();
+}
 
 static void ota_health_refresh_mask_from_criteria(void)
 {
@@ -46,6 +58,9 @@ bool ota_health_init(void)
 {
     s_passed_criteria_mask = 0;
     s_criteria = (ota_health_criteria_t){ 0 };
+    s_is_pending_verify = false;
+    s_rollback_handled = false;
+    s_validation_start_us = 0;
     evaluate_criteria();
 
     const esp_partition_t *running = esp_ota_get_running_partition();
@@ -62,6 +77,7 @@ bool ota_health_init(void)
             s_is_pending_verify = true;
             s_is_validated = false;
             s_seconds_in_validation = 0;
+            s_validation_start_us = ota_health_now_us();
             ESP_LOGW(TAG, "=========================================================");
             ESP_LOGW(TAG, "NEW FIRMWARE DETECTED IN PENDING_VERIFY STATE (Slot: %s)", running->label);
             ESP_LOGW(TAG, "Starting %d-second post-update health observation window.", OTA_HEALTH_VALIDATION_WINDOW_S);
@@ -99,26 +115,32 @@ static void evaluate_criteria(void)
     bool verif_en = true;
     s_criteria.nvs_healthy       = nvs_manager_get_cmd_verifier_enabled(&verif_en);
 
-    /* 3. Zigbee stack lifecycle health */
-    zb_network_state_t zb_st     = zigbee_app_get_state();
-    s_criteria.zigbee_healthy    = (zb_st != ZB_STATE_COMMISSION_FAILED);
+    /* Network joining is not required for native Zigbee stack readiness. */
+    s_criteria.zigbee_healthy = s_zigbee_ready_fn_for_test != NULL
+        ? s_zigbee_ready_fn_for_test()
+        : (zigbee_native_stack_get_state() == ZB_STACK_STATE_RUNNING &&
+           zigbee_device_model_is_registered());
 
-    /* 4. Z906 communication and state manager health */
-    z906_state_t st;
-    z906_state_get(&st);
-    /* Operational or successfully initialized communication layer */
-    s_criteria.z906_comm_healthy = (st.volume <= 43);
+    /* A verified CONFIG frame received during this boot plus cable presence
+     * is the minimum physical Z906 health signal; default volume is not. */
+    s_criteria.z906_comm_healthy = z906_state_is_main_valid();
 
     ota_health_refresh_mask_from_criteria();
 }
 
 void ota_health_process_cycle(uint32_t elapsed_sec)
 {
-    if (!s_is_pending_verify || s_is_validated) {
+    if (!s_is_pending_verify || s_is_validated || s_rollback_handled) {
         return;
     }
 
-    s_seconds_in_validation += elapsed_sec;
+    /* Use monotonic time since pending boot; do not assume periodic task ticks. */
+    (void)elapsed_sec; /* Kept for existing callers; elapsed time is measured. */
+    int64_t elapsed_us = ota_health_now_us() - s_validation_start_us;
+    if (elapsed_us < 0) {
+        return; /* A clock anomaly must never approve an OTA image. */
+    }
+    s_seconds_in_validation = (uint32_t)(elapsed_us / 1000000LL);
     evaluate_criteria();
 
     bool all_criteria_met = s_criteria.scheduler_healthy &&
@@ -172,8 +194,22 @@ bool ota_health_is_pending_verify(void)
 
 void ota_health_trigger_rollback(const char *reason)
 {
-    ESP_LOGE(TAG, "TRIGGERING IMMEDIATE FIRMWARE ROLLBACK: Reason: %s", reason ? reason : "Unknown");
+    if (s_rollback_handled) {
+        return;
+    }
+    s_rollback_handled = true;
+    ESP_LOGE(TAG, "OTA health failed: %s", reason ? reason : "Unknown");
     led_notification_post_cmd_result(false);
+
+    bool fallback_available = s_fallback_available_fn_for_test != NULL
+        ? s_fallback_available_fn_for_test()
+        : esp_ota_check_rollback_is_possible();
+    if (!fallback_available) {
+        /* Never force a restart loop without a known-good previous image.
+         * Leave the running image pending and require a recovery decision. */
+        ESP_LOGE(TAG, "No valid rollback partition available; refusing forced restart");
+        return;
+    }
 
     if (s_rollback_fn_for_test != NULL) {
         s_rollback_fn_for_test(reason);
@@ -182,9 +218,8 @@ void ota_health_trigger_rollback(const char *reason)
 
     esp_err_t err = esp_ota_mark_app_invalid_rollback_and_reboot();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_ota_mark_app_invalid_rollback_and_reboot failed: %s! Forcing software restart...",
+        ESP_LOGE(TAG, "Rollback rejected: %s; staying pending for diagnostics",
                  esp_err_to_name(err));
-        esp_restart();
     }
 }
 
@@ -246,6 +281,23 @@ void ota_health_set_pending_verify_for_test(bool pending)
     s_is_pending_verify = pending;
     s_is_validated = false;
     s_seconds_in_validation = 0;
+    s_rollback_handled = false;
+    s_validation_start_us = ota_health_now_us();
+}
+
+void ota_health_set_time_fn_for_test(ota_health_time_fn_t fn)
+{
+    s_time_fn_for_test = fn;
+}
+
+void ota_health_set_zigbee_ready_fn_for_test(ota_health_bool_fn_t fn)
+{
+    s_zigbee_ready_fn_for_test = fn;
+}
+
+void ota_health_set_fallback_available_fn_for_test(ota_health_bool_fn_t fn)
+{
+    s_fallback_available_fn_for_test = fn;
 }
 
 void ota_health_set_rollback_fn_for_test(ota_rollback_fn_t fn)
@@ -263,7 +315,12 @@ void ota_health_reset_for_test(void)
     s_is_pending_verify = false;
     s_is_validated = false;
     s_seconds_in_validation = 0;
+    s_validation_start_us = 0;
+    s_rollback_handled = false;
     s_rollback_detected = false;
+    s_time_fn_for_test = NULL;
+    s_zigbee_ready_fn_for_test = NULL;
+    s_fallback_available_fn_for_test = NULL;
     s_rollback_fn_for_test = NULL;
     s_mark_valid_fn_for_test = NULL;
     memset(&s_criteria, 0, sizeof(s_criteria));
