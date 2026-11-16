@@ -77,26 +77,26 @@ jobs:
 
       - name: Prepare Release Artifacts Directory
         run: |
-          mkdir -p release_assets
-          cp .pio/build/esp32-c6-devkitc-1/firmware.bin release_assets/
-          cp dist/1000-0906-010400aa-LogitechZ906.ota release_assets/
-          cp dist/index.json release_assets/
-          cp tools/conductor_converter.mjs release_assets/
+          mkdir -p dist/release
+          cp .pio/build/esp32-c6-devkitc-1/firmware.bin dist/release/
+          cp dist/1000-0906-010400aa-LogitechZ906.ota dist/release/
+          cp dist/index.json dist/release/
+          cp tools/conductor_converter.mjs dist/release/
 
       - name: Attest Build Provenance for Release Assets
         uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
         with:
           subject-path: |
-            release_assets/firmware.bin
-            release_assets/1000-0906-010400aa-LogitechZ906.ota
-            release_assets/index.json
-            release_assets/conductor_converter.mjs
+            dist/release/firmware.bin
+            dist/release/1000-0906-010400aa-LogitechZ906.ota
+            dist/release/index.json
+            dist/release/conductor_converter.mjs
 
       - name: Upload Release Artifacts
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
         with:
           name: release-assets
-          path: release_assets/
+          path: dist/release/
           retention-days: 7
 
   publish-release:
@@ -113,7 +113,7 @@ jobs:
         uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
         with:
           name: release-assets
-          path: release_assets/
+          path: dist/release/
 
       - name: Create GitHub Release and Upload Verified Artifacts
         uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
@@ -123,7 +123,7 @@ jobs:
           prerelease: false
           generate_release_notes: true
           files: |
-            release_assets/firmware.bin
-            release_assets/1000-0906-010400aa-LogitechZ906.ota
-            release_assets/index.json
-            release_assets/conductor_converter.mjs
+            dist/release/firmware.bin
+            dist/release/1000-0906-010400aa-LogitechZ906.ota
+            dist/release/index.json
+            dist/release/conductor_converter.mjs
