@@ -103,6 +103,7 @@ HARNESS = r"""
 
 static int64_t s_now = 1000000;
 static bool s_z906_ok;
+static int64_t s_status_at_us;
 static bool s_zigbee_ok;
 static bool s_fallback_ok;
 static int s_valid_count;
@@ -120,6 +121,7 @@ zb_stack_state_t zigbee_native_stack_get_state(void) {
 }
 bool zigbee_device_model_is_registered(void) { return s_zigbee_ok; }
 bool z906_state_is_main_valid(void) { return s_z906_ok; }
+int64_t z906_state_get_main_status_time_us(void) { return s_z906_ok ? s_status_at_us : 0; }
 void led_notification_post_cmd_result(bool success) { (void)success; }
 void ota_client_note_health_failure(const char *s) { (void)s; ++s_failure_count; }
 const char *esp_err_to_name(esp_err_t err) { (void)err; return "mock"; }
@@ -137,6 +139,7 @@ static void reset_case(void) {
     ota_health_reset_for_test();
     s_now = 1000000;
     s_z906_ok = false;
+    s_status_at_us = 0;
     s_zigbee_ok = true;
     s_fallback_ok = true;
     s_valid_count = 0;
@@ -149,6 +152,10 @@ static void advance(unsigned seconds) {
     s_now += (int64_t)seconds * 1000000;
     ota_health_process_cycle(1);
 }
+static void report_verified_status(void) {
+    s_z906_ok = true;
+    s_status_at_us = s_now;
+}
 int main(void) {
     /* 15 s with no verified amplifier frame must roll back. */
     reset_case();
@@ -157,17 +164,19 @@ int main(void) {
 
     /* Native stack running, unjoined, and valid Z906 status permits commit at 15 s. */
     reset_case();
-    s_z906_ok = true;
-    advance(14);
+    advance(11);
+    report_verified_status();
+    advance(3);
     assert(s_valid_count == 0);
     advance(1);
     assert(s_valid_count == 1 && s_rollback_count == 0 && ota_health_is_validated());
 
     /* Not merely "network state != commissioning failed": stack must run. */
     reset_case();
-    s_z906_ok = true;
+    advance(11);
+    report_verified_status();
     s_zigbee_ok = false;
-    advance(15);
+    advance(4);
     assert(s_valid_count == 0 && s_rollback_count == 1);
 
     /* No fallback image: no forced restart, no false validation or repeat abort. */
@@ -180,18 +189,34 @@ int main(void) {
 
     /* A stalled scheduler must not shorten or stretch the observation window. */
     reset_case();
-    s_z906_ok = true;
-    advance(16);
+    advance(12);
+    report_verified_status();
+    advance(4);
     assert(s_valid_count == 1 && s_rollback_count == 0);
 
     /* Negative elapsed time must not allow image approval. */
     reset_case();
-    s_z906_ok = true;
-    s_now -= 1000000;
+    advance(1);
+    report_verified_status();
+    s_now -= 2000000;
     ota_health_process_cycle(1000);
     assert(s_valid_count == 0 && s_rollback_count == 0);
 
-    puts("PASS: OTA runtime health C host harness (6 scenarios)");
+    /* A lone first-second CONFIG reply must become stale before the decision. */
+    reset_case();
+    advance(1);
+    report_verified_status();
+    advance(14);
+    assert(s_valid_count == 0 && s_rollback_count == 1);
+
+    /* A response before the pending window is not usable OTA evidence. */
+    reset_case();
+    s_z906_ok = true;
+    s_status_at_us = s_now - 500000;
+    advance(15);
+    assert(s_valid_count == 0 && s_rollback_count == 1);
+
+    puts("PASS: OTA runtime health C host harness (8 scenarios)");
     return 0;
 }
 """

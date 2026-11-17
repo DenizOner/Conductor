@@ -14,6 +14,7 @@
 #include "z906_state.h"
 /* Include project configuration header */
 #include "config.h"
+#include "esp_timer.h"
 /* FreeRTOS headers for concurrent-writer test */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -39,6 +40,19 @@ void tearDown(void)
 /**
  * @brief Tests default initialization state.
  */
+/** @brief Verified CONFIG timestamps are invalidated on cable loss. */
+void test_main_status_timestamp_invalidated_on_cable_loss(void)
+{
+    TEST_ASSERT_EQUAL_INT64(0, z906_state_get_main_status_time_us());
+    z906_state_set_cable_status(true);
+    z906_state_set_main_valid(true);
+    int64_t confirmed_at = z906_state_get_main_status_time_us();
+    TEST_ASSERT_TRUE(confirmed_at > 0);
+    TEST_ASSERT_TRUE(confirmed_at <= esp_timer_get_time());
+    z906_state_set_cable_status(false);
+    TEST_ASSERT_EQUAL_INT64(0, z906_state_get_main_status_time_us());
+}
+
 void test_state_defaults(void)
 {
     /* State container struct */
@@ -497,6 +511,7 @@ int runUnityTests(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_state_defaults);
+    RUN_TEST(test_main_status_timestamp_invalidated_on_cable_loss);
     RUN_TEST(test_state_volume_boundaries);
     RUN_TEST(test_state_input_transitions);
     RUN_TEST(test_state_telemetry_fields);
