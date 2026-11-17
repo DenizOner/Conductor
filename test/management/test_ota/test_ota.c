@@ -22,6 +22,7 @@ static int s_rollback_call_count = 0;
 static const char *s_last_rollback_reason = NULL;
 static int64_t s_fake_time_us = 1000000;
 static bool s_fake_zigbee_ready = true;
+static bool s_fake_nvs_ok = true;
 static bool s_fake_fallback_available = true;
 static bool s_auto_status_refresh = false;
 static unsigned s_status_tick_counter = 0;
@@ -30,6 +31,7 @@ static int64_t s_fake_status_time_us = 0;
 static int64_t mock_health_time(void) { return s_fake_time_us; }
 static int64_t mock_status_time(void) { return s_fake_status_time_us; }
 static bool mock_zigbee_ready(void) { return s_fake_zigbee_ready; }
+static bool mock_nvs_ok(void) { return s_fake_nvs_ok; }
 static bool mock_fallback_available(void) { return s_fake_fallback_available; }
 
 static void advance_health_second(void)
@@ -65,6 +67,7 @@ void setUp(void)
     ota_health_reset_for_test();
     s_fake_time_us = 1000000;
     s_fake_zigbee_ready = true;
+    s_fake_nvs_ok = true;
     s_fake_fallback_available = true;
     s_auto_status_refresh = false;
     s_status_tick_counter = 0;
@@ -72,6 +75,7 @@ void setUp(void)
     ota_health_set_time_fn_for_test(mock_health_time);
     ota_health_set_z906_status_time_fn_for_test(mock_status_time);
     ota_health_set_zigbee_ready_fn_for_test(mock_zigbee_ready);
+    ota_health_set_nvs_healthy_fn_for_test(mock_nvs_ok);
     ota_health_set_fallback_available_fn_for_test(mock_fallback_available);
     s_rollback_call_count = 0;
     s_last_rollback_reason = NULL;
@@ -445,6 +449,21 @@ void test_ota_status_before_pending_is_not_fresh(void)
     TEST_ASSERT_FALSE(ota_health_is_validated());
 }
 
+/** @brief Real NVS I/O failures must not be hidden by verifier defaults. */
+void test_ota_nvs_read_failure_rejects_image(void)
+{
+    ota_health_set_rollback_fn_for_test(mock_rollback_fn);
+    ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
+    ota_health_set_pending_verify_for_test(true);
+    s_auto_status_refresh = true;
+    s_fake_nvs_ok = false;
+    for (int i = 0; i < 15; i++) {
+        advance_health_second();
+    }
+    TEST_ASSERT_EQUAL_INT(1, s_rollback_call_count);
+    TEST_ASSERT_FALSE(ota_health_is_validated());
+}
+
 int runUnityTests(void)
 {
     UNITY_BEGIN();
@@ -467,6 +486,7 @@ int runUnityTests(void)
     RUN_TEST(test_ota_status_arrives_during_window);
     RUN_TEST(test_ota_stale_status_does_not_approve_image);
     RUN_TEST(test_ota_status_before_pending_is_not_fresh);
+    RUN_TEST(test_ota_nvs_read_failure_rejects_image);
     return UNITY_END();
 }
 

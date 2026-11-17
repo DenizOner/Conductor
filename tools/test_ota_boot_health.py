@@ -63,7 +63,7 @@ bool wdt_manager_was_watchdog_reset(void);
     "nvs_manager.h": """
 #pragma once
 #include <stdbool.h>
-bool nvs_manager_get_cmd_verifier_enabled(bool *);
+bool nvs_manager_check_read_health(void);
 """,
     "zigbee_native_stack.h": """
 #pragma once
@@ -116,7 +116,8 @@ int64_t esp_timer_get_time(void) { return s_now; }
 int xTaskGetSchedulerState(void) { return 1; }
 bool wdt_manager_is_initialized(void) { return true; }
 bool wdt_manager_was_watchdog_reset(void) { return false; }
-bool nvs_manager_get_cmd_verifier_enabled(bool *p) { *p = true; return true; }
+static bool s_nvs_ok = true;
+bool nvs_manager_check_read_health(void) { return s_nvs_ok; }
 zb_stack_state_t zigbee_native_stack_get_state(void) {
     return s_zigbee_ok ? ZB_STACK_STATE_RUNNING : ZB_STACK_STATE_UNINITIALIZED;
 }
@@ -142,6 +143,7 @@ static void reset_case(void) {
     s_z906_ok = false;
     s_status_at_us = 0;
     s_zigbee_ok = true;
+    s_nvs_ok = true;
     s_fallback_ok = true;
     s_valid_count = 0;
     s_rollback_count = 0;
@@ -177,6 +179,14 @@ int main(void) {
     advance(11);
     report_verified_status();
     s_zigbee_ok = false;
+    advance(4);
+    assert(s_valid_count == 0 && s_rollback_count == 1);
+
+    /* Genuine NVS read errors must not approve firmware. */
+    reset_case();
+    advance(11);
+    report_verified_status();
+    s_nvs_ok = false;
     advance(4);
     assert(s_valid_count == 0 && s_rollback_count == 1);
 
@@ -217,7 +227,7 @@ int main(void) {
     advance(15);
     assert(s_valid_count == 0 && s_rollback_count == 1);
 
-    puts("PASS: OTA runtime health C host harness (8 scenarios)");
+    puts("PASS: OTA runtime health C host harness (9 scenarios)");
     return 0;
 }
 """
