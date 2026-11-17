@@ -79,6 +79,7 @@ bool zigbee_device_model_is_registered(void);
 #pragma once
 #include <stdbool.h>
 bool z906_state_is_main_valid(void);
+int64_t z906_state_get_main_status_time_us(void);
 """,
     "led_notification_manager.h": """
 #pragma once
