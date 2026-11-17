@@ -40,6 +40,7 @@ jobs:
           python3 tools/test_ota_boot_health.py
           python3 tools/test_z906_codec_host.py
           python3 tools/test_nvs_health.py
+          python3 tools/test_telemetry_query_host.py
 
   build-firmware:
     name: Build Firmware Binary & Validate OTA
