@@ -25,6 +25,13 @@ typedef struct {
     bool z906_comm_healthy;         /**< Z906 UART HAL and Command Verifier active without fatal errors */
 } ota_health_criteria_t;
 
+typedef enum {
+    OTA_HEALTH_RECOVERY_NONE = 0,
+    OTA_HEALTH_RECOVERY_REQUESTED,
+    OTA_HEALTH_RECOVERY_NO_FALLBACK,
+    OTA_HEALTH_RECOVERY_ROLLBACK_ERROR
+} ota_health_recovery_state_t;
+
 #define OTA_CRITERION_SCHEDULER   (1u << 0)
 #define OTA_CRITERION_TWDT        (1u << 1)
 #define OTA_CRITERION_NVS         (1u << 2)
@@ -60,6 +67,10 @@ bool ota_health_is_pending_verify(void);
  * @param reason Reason description string for logging.
  */
 void ota_health_trigger_rollback(const char *reason);
+
+/** @brief Read-only recovery diagnostic (does not initiate any recovery). */
+ota_health_recovery_state_t ota_health_get_recovery_state(void);
+const char *ota_health_recovery_state_str(ota_health_recovery_state_t state);
 
 /**
  * @brief Retrieves current health criteria status snapshot.

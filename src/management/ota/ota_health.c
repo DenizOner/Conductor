@@ -42,6 +42,7 @@ static ota_health_bool_fn_t s_nvs_healthy_fn_for_test = NULL;
 static ota_health_bool_fn_t s_twdt_healthy_fn_for_test = NULL;
 static bool s_telemetry_twdt_feed_ok = false;
 static bool s_finalization_in_progress = false;
+static ota_health_recovery_state_t s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
 /* Short state snapshots only: SDK / NVS / OTA APIs are NEVER called under this spinlock. */
 static portMUX_TYPE s_health_mux = portMUX_INITIALIZER_UNLOCKED;
 static ota_health_bool_fn_t s_fallback_available_fn_for_test = NULL;
@@ -70,6 +71,8 @@ bool ota_health_init(void)
     s_is_pending_verify = false;
     s_rollback_handled = false;
     s_finalization_in_progress = false;
+    s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
+    s_rollback_detected = false;
     s_validation_start_us = 0;
     evaluate_criteria();
 
@@ -259,11 +262,18 @@ void ota_health_trigger_rollback(const char *reason)
         ? s_fallback_available_fn_for_test()
         : esp_ota_check_rollback_is_possible();
     if (!fallback_available) {
-        /* Never force a restart loop without a known-good previous image.
-         * Leave the running image pending and require a recovery decision. */
-        ESP_LOGE(TAG, "No valid rollback partition available; refusing forced restart");
+        /* No unbootable restart loop. The bootloader may still reject this
+         * pending image on a later reboot: do not promise permanent safety. */
+        portENTER_CRITICAL(&s_health_mux);
+        s_recovery_state = OTA_HEALTH_RECOVERY_NO_FALLBACK;
+        portEXIT_CRITICAL(&s_health_mux);
+        ESP_LOGE(TAG, "No valid fallback; pending image remains unconfirmed; recovery required");
         return;
     }
+
+    portENTER_CRITICAL(&s_health_mux);
+    s_recovery_state = OTA_HEALTH_RECOVERY_REQUESTED;
+    portEXIT_CRITICAL(&s_health_mux);
 
     if (s_rollback_fn_for_test != NULL) {
         s_rollback_fn_for_test(reason);
@@ -272,8 +282,30 @@ void ota_health_trigger_rollback(const char *reason)
 
     esp_err_t err = esp_ota_mark_app_invalid_rollback_and_reboot();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Rollback rejected: %s; staying pending for diagnostics",
+        portENTER_CRITICAL(&s_health_mux);
+        s_recovery_state = OTA_HEALTH_RECOVERY_ROLLBACK_ERROR;
+        portEXIT_CRITICAL(&s_health_mux);
+        ESP_LOGE(TAG, "Rollback rejected: %s; pending image requires manual recovery",
                  esp_err_to_name(err));
+    }
+}
+
+ota_health_recovery_state_t ota_health_get_recovery_state(void)
+{
+    portENTER_CRITICAL(&s_health_mux);
+    ota_health_recovery_state_t state = s_recovery_state;
+    portEXIT_CRITICAL(&s_health_mux);
+    return state;
+}
+
+const char *ota_health_recovery_state_str(ota_health_recovery_state_t state)
+{
+    switch (state) {
+        case OTA_HEALTH_RECOVERY_NONE:           return "NONE";
+        case OTA_HEALTH_RECOVERY_REQUESTED:      return "ROLLBACK_REQUESTED";
+        case OTA_HEALTH_RECOVERY_NO_FALLBACK:    return "NO_VALID_FALLBACK";
+        case OTA_HEALTH_RECOVERY_ROLLBACK_ERROR: return "ROLLBACK_API_ERROR";
+        default:                                return "UNKNOWN";
     }
 }
 
@@ -368,6 +400,7 @@ void ota_health_set_pending_verify_for_test(bool pending)
     s_seconds_in_validation = 0;
     s_rollback_handled = false;
     s_finalization_in_progress = false;
+    s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
     s_validation_start_us = ota_health_now_us();
 }
 
@@ -419,6 +452,7 @@ void ota_health_reset_for_test(void)
     s_validation_start_us = 0;
     s_rollback_handled = false;
     s_finalization_in_progress = false;
+    s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
     s_rollback_detected = false;
     s_time_fn_for_test = NULL;
     s_status_time_fn_for_test = NULL;

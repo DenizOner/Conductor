@@ -80,7 +80,13 @@ static void cmd_dev_ota_status(void)
     printf("Transfer Progress:   %d%% (%lu / %lu bytes)\n",
            diag.progress_percent, (unsigned long)diag.bytes_downloaded, (unsigned long)diag.total_image_size);
     printf("Target File Version: 0x%08lX\n", (unsigned long)diag.target_file_version);
-    printf("Pending Validation:  %s\n", diag.is_pending_verify ? "YES (Observation window active)" : "NO (Confirmed VALID)");
+    ota_health_recovery_state_t recovery = ota_health_get_recovery_state();
+    printf("Pending Validation:  %s\n", diag.is_pending_verify ? "YES (not yet confirmed)" : "NO");
+    printf("Recovery State:      %s\n", ota_health_recovery_state_str(recovery));
+    if (recovery == OTA_HEALTH_RECOVERY_NO_FALLBACK ||
+        recovery == OTA_HEALTH_RECOVERY_ROLLBACK_ERROR) {
+        printf("WARNING: OTA image is unconfirmed; manual recovery decision required.\n");
+    }
     printf("Rollback Possible:   %s\n", diag.is_rollback_possible ? "YES" : "NO");
     printf("Previous Rollback:   %s\n", ota_health_was_rollback_detected() ? "DETECTED ON BOOT" : "NONE");
     printf("Health Criteria:     Sched=%d, WDT=%d, NVS=%d, ZB=%d, Z906=%d\n",
