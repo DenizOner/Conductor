@@ -48,7 +48,13 @@ int64_t esp_timer_get_time(void);
 #pragma once
 void esp_restart(void);
 """,
-    "freertos/FreeRTOS.h": "#pragma once\n",
+    "freertos/FreeRTOS.h": """
+#pragma once
+typedef int portMUX_TYPE;
+#define portMUX_INITIALIZER_UNLOCKED 0
+#define portENTER_CRITICAL(m) ((void)(m))
+#define portEXIT_CRITICAL(m) ((void)(m))
+""",
     "freertos/task.h": """
 #pragma once
 #define taskSCHEDULER_RUNNING 1
@@ -58,6 +64,7 @@ int xTaskGetSchedulerState(void);
 #pragma once
 #include <stdbool.h>
 bool wdt_manager_is_initialized(void);
+bool wdt_manager_is_current_task_registered(void);
 bool wdt_manager_was_watchdog_reset(void);
 """,
     "nvs_manager.h": """
@@ -116,6 +123,7 @@ int64_t esp_timer_get_time(void) { return s_now; }
 int xTaskGetSchedulerState(void) { return 1; }
 bool wdt_manager_is_initialized(void) { return true; }
 bool wdt_manager_was_watchdog_reset(void) { return false; }
+bool wdt_manager_is_current_task_registered(void) { return true; }
 static bool s_nvs_ok = true;
 bool nvs_manager_check_read_health(void) { return s_nvs_ok; }
 zb_stack_state_t zigbee_native_stack_get_state(void) {
@@ -149,6 +157,7 @@ static void reset_case(void) {
     s_rollback_count = 0;
     s_failure_count = 0;
     assert(ota_health_init());
+    ota_health_report_twdt_observation(true);
     assert(ota_health_is_pending_verify());
 }
 static void advance(unsigned seconds) {
@@ -179,6 +188,14 @@ int main(void) {
     advance(11);
     report_verified_status();
     s_zigbee_ok = false;
+    advance(4);
+    assert(s_valid_count == 0 && s_rollback_count == 1);
+
+    /* The current telemetry task must report a successful TWDT feed. */
+    reset_case();
+    advance(11);
+    report_verified_status();
+    ota_health_report_twdt_observation(false);
     advance(4);
     assert(s_valid_count == 0 && s_rollback_count == 1);
 
@@ -227,7 +244,7 @@ int main(void) {
     advance(15);
     assert(s_valid_count == 0 && s_rollback_count == 1);
 
-    puts("PASS: OTA runtime health C host harness (9 scenarios)");
+    puts("PASS: OTA runtime health C host harness (10 scenarios)");
     return 0;
 }
 """
