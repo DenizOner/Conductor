@@ -84,6 +84,9 @@ HARNESS = r"""
 #include <setjmp.h>
 #include "z906_transport.h"
 #include "event_bus.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "uart_hal.h"
 
 static jmp_buf s_stop;
 static uint32_t s_epoch;
