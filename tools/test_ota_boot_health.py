@@ -16,6 +16,7 @@ HEADERS = {
 #pragma once
 typedef int esp_err_t;
 #define ESP_OK 0
+#define ESP_FAIL (-1)
 const char *esp_err_to_name(esp_err_t err);
 """,
     "esp_ota_ops.h": """
@@ -114,6 +115,7 @@ static bool s_z906_ok;
 static int64_t s_status_at_us;
 static bool s_zigbee_ok;
 static bool s_fallback_ok;
+static esp_err_t s_rollback_result = ESP_OK;
 static int s_valid_count;
 static int s_rollback_count;
 static int s_failure_count;
@@ -142,7 +144,7 @@ esp_err_t esp_ota_get_state_partition(const esp_partition_t *p, esp_ota_img_stat
 }
 bool esp_ota_check_rollback_is_possible(void) { return s_fallback_ok; }
 esp_err_t esp_ota_mark_app_valid_cancel_rollback(void) { ++s_valid_count; return ESP_OK; }
-esp_err_t esp_ota_mark_app_invalid_rollback_and_reboot(void) { ++s_rollback_count; return ESP_OK; }
+esp_err_t esp_ota_mark_app_invalid_rollback_and_reboot(void) { ++s_rollback_count; return s_rollback_result; }
 void esp_restart(void) { assert(!"unexpected forced reboot"); }
 
 static void reset_case(void) {
@@ -153,6 +155,7 @@ static void reset_case(void) {
     s_zigbee_ok = true;
     s_nvs_ok = true;
     s_fallback_ok = true;
+    s_rollback_result = ESP_OK;
     s_valid_count = 0;
     s_rollback_count = 0;
     s_failure_count = 0;
@@ -214,6 +217,15 @@ int main(void) {
     advance(2);
     assert(s_valid_count == 0 && s_rollback_count == 0);
     assert(ota_health_is_pending_verify());
+    assert(ota_health_get_recovery_state() == OTA_HEALTH_RECOVERY_NO_FALLBACK);
+
+    /* A rejected rollback API must be reported without repeated reboots. */
+    reset_case();
+    s_rollback_result = ESP_FAIL;
+    advance(15);
+    advance(1);
+    assert(s_rollback_count == 1 && s_valid_count == 0);
+    assert(ota_health_get_recovery_state() == OTA_HEALTH_RECOVERY_ROLLBACK_ERROR);
 
     /* A stalled scheduler must not shorten or stretch the observation window. */
     reset_case();
@@ -244,7 +256,7 @@ int main(void) {
     advance(15);
     assert(s_valid_count == 0 && s_rollback_count == 1);
 
-    puts("PASS: OTA runtime health C host harness (10 scenarios)");
+    puts("PASS: OTA runtime health C host harness (11 scenarios)");
     return 0;
 }
 """
