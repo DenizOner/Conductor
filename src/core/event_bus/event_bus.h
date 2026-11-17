@@ -38,7 +38,8 @@ typedef struct {
         uint8_t raw_byte;
         bool cable_connected;
     } data;
-    /* Amplifier RX monotonic first-byte time; zero for other event types. */
+    /* Monotonic UART driver-read time (not hardware byte-arrival time).
+     * Zero for non-amplifier RX events. */
     int64_t received_at_us;
     /* RX bytes carry their ingest-time cable and stream generation. Cable
      * events are advisory; FSM must not depend on queue delivery for safety. */

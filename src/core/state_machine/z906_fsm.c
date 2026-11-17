@@ -26,7 +26,7 @@ static const char *TAG = "Z906_FSM";
 
 static z906_fsm_state_t s_fsm_state = FSM_STATE_UNINITIALIZED;
 static z906_codec_ctx_t s_amp_codec_ctx;
-/* First byte time, captured at UART ingress, not the later FSM queue drain. */
+/* First byte's UART task read time, not the later FSM queue drain time. */
 static int64_t s_amp_frame_started_us = 0;
 static uint32_t s_fsm_cable_epoch = 0;
 static uint32_t s_fsm_rx_stream_epoch = 0;
@@ -87,8 +87,8 @@ static void handle_amp_byte(uint8_t byte, int64_t received_at_us, uint32_t cable
     /* 1. Forward raw byte to physical console */
     z906_uart_hal_write_console(&byte, 1);
 
-    /* 2. A queued old frame cannot be given the time it was processed.
-     * Anchor complete CONFIG/telemetry replies to their first byte at RX. */
+    /* 2. Use the first byte's UART task read time instead of FSM handling time.
+     * ESP-IDF UART ring buffers do not supply hardware byte-arrival timestamps. */
     if (!z906_codec_is_frame_in_progress(&s_amp_codec_ctx) && byte == 0xAA) {
         s_amp_frame_started_us = received_at_us;
     }
