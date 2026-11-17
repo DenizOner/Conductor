@@ -28,6 +28,8 @@ static z906_fsm_state_t s_fsm_state = FSM_STATE_UNINITIALIZED;
 static z906_codec_ctx_t s_amp_codec_ctx;
 /* First byte time, captured at UART ingress, not the later FSM queue drain. */
 static int64_t s_amp_frame_started_us = 0;
+static uint32_t s_fsm_cable_epoch = 0;
+static uint32_t s_fsm_rx_stream_epoch = 0;
 
 static void fsm_set_state(z906_fsm_state_t new_state)
 {
@@ -46,6 +48,8 @@ bool z906_fsm_init(void)
 {
     z906_codec_init(&s_amp_codec_ctx);
     s_amp_frame_started_us = 0;
+    s_fsm_cable_epoch = z906_state_get_cable_epoch();
+    s_fsm_rx_stream_epoch = 0;
     fsm_set_state(FSM_STATE_BOOTING);
     return true;
 }
@@ -75,7 +79,7 @@ static void handle_console_byte(uint8_t byte)
     z906_uart_hal_write_amp(&byte, 1);
 }
 
-static void handle_amp_byte(uint8_t byte, int64_t received_at_us)
+static void handle_amp_byte(uint8_t byte, int64_t received_at_us, uint32_t cable_epoch)
 {
     /* 1. Forward raw byte to physical console */
     z906_uart_hal_write_console(&byte, 1);
@@ -96,9 +100,10 @@ static void handle_amp_byte(uint8_t byte, int64_t received_at_us)
             case Z906_PACKET_CONFIG: {
                 z906_state_t cable_state;
                 z906_state_get(&cable_state);
-                if (!cable_state.cable_connected) {
-                    /* Preserve raw passthrough above; drop only stale state. */
-                    ESP_LOGW(TAG, "Discarding CONFIG state while DE-15 is disconnected");
+                if (!cable_state.cable_connected ||
+                    z906_state_get_cable_epoch() != cable_epoch) {
+                    /* Preserve raw passthrough; discard stale physical state. */
+                    ESP_LOGW(TAG, "Discarding CONFIG from stale/unplugged cable epoch");
                     break;
                 }
                 ESP_LOGI(TAG, "Confirmed Amp Config: Vol=%d, Input=%d, Effect=%d, Mute=%d, Standby=%d",
@@ -116,7 +121,10 @@ static void handle_amp_byte(uint8_t byte, int64_t received_at_us)
 
                 /* Set confirmed physical power state directly from Byte 17 (0 = ON, 1 = Standby) */
                 z906_state_set_power(!pkt.data.config.standby);
-                z906_state_set_main_valid(true);
+                if (!z906_state_confirm_main_for_epoch(cable_epoch)) {
+                    /* Cable changed during CONFIG state updates. No OTA proof. */
+                    break;
+                }
                 if (pkt.data.config.standby) {
                     fsm_set_state(FSM_STATE_STANDBY);
                 } else if (pkt.data.config.mute) {
@@ -258,10 +266,23 @@ static void handle_amp_byte(uint8_t byte, int64_t received_at_us)
     }
 }
 
+static void fsm_sync_cable_epoch(void)
+{
+    uint32_t current = z906_state_get_cable_epoch();
+    if (current != s_fsm_cable_epoch) {
+        /* Direct state generation, never a lossy EventBus cable notification. */
+        z906_codec_init(&s_amp_codec_ctx);
+        s_amp_frame_started_us = 0;
+        s_fsm_cable_epoch = current;
+    }
+}
+
 void z906_fsm_step(TickType_t block_time)
 {
     z906_event_t event;
-    if (!event_bus_receive(&event, block_time)) {
+    bool received = event_bus_receive(&event, block_time);
+    fsm_sync_cable_epoch();
+    if (!received) {
         return;
     }
 
@@ -271,20 +292,36 @@ void z906_fsm_step(TickType_t block_time)
             break;
 
         case EVENT_AMP_RX_BYTE:
-            handle_amp_byte(event.data.raw_byte, event.received_at_us);
+            if (event.cable_epoch != s_fsm_cable_epoch) {
+                /* Passthrough byte is preserved, but never decoded as new state. */
+                z906_uart_hal_write_console(&event.data.raw_byte, 1);
+                break;
+            }
+            if (event.rx_stream_epoch != s_fsm_rx_stream_epoch) {
+                /* The UART-to-EventBus bridge dropped a byte or flushed RX. */
+                z906_codec_init(&s_amp_codec_ctx);
+                s_amp_frame_started_us = 0;
+                s_fsm_rx_stream_epoch = event.rx_stream_epoch;
+            }
+            handle_amp_byte(event.data.raw_byte, event.received_at_us,
+                            event.cable_epoch);
             break;
 
-        case EVENT_CABLE_STATUS_CHANGED:
-            /* A frame begun before a cable transition may not complete in the
-             * new physical connection epoch. Do not reuse partial bytes. */
-            z906_codec_init(&s_amp_codec_ctx);
-            s_amp_frame_started_us = 0;
-            if (!event.data.cable_connected) {
+        case EVENT_CABLE_STATUS_CHANGED: {
+            /* Advisory only: a stale queued cable event must not reset a valid
+             * newer frame or override the current physical connection state. */
+            z906_state_t physical;
+            z906_state_get(&physical);
+            if (event.data.cable_connected != physical.cable_connected) {
+                break;
+            }
+            if (!physical.cable_connected) {
                 fsm_set_state(FSM_STATE_FAULT);
             } else if (s_fsm_state == FSM_STATE_FAULT) {
                 fsm_set_state(FSM_STATE_STANDBY);
             }
             break;
+        }
 
         default:
             break;

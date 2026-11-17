@@ -181,6 +181,16 @@ bool z906_state_set_input_signal_level(uint32_t level);
  */
 void z906_state_set_cable_status(bool connected);
 
+/** @brief Last observed ADC cable connection generation, independent of EventBus.
+ *         The 32-bit epoch advances on every observed connect/disconnect transition.
+ */
+uint32_t z906_state_get_cable_epoch(void);
+
+/** @brief Atomically confirms CONFIG only for the currently connected cable epoch.
+ *         A queued reply from an earlier epoch cannot restore main_state_valid.
+ */
+bool z906_state_confirm_main_for_epoch(uint32_t expected_epoch);
+
 /**
  * @brief Sets the validity of main control hardware state (power, volume, trims, etc.).
  * @param valid true once first complete status configuration frame is processed.

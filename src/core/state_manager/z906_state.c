@@ -37,6 +37,8 @@ static StaticSemaphore_t s_mutex_buffer;
 static int64_t s_last_main_status_time_us = 0;
 /* Only an in-window reply to a telemetry STATUS request is OTA evidence. */
 static int64_t s_last_matched_status_time_us = 0;
+/* Monotonic logical cable session, protected by the existing state mutex. */
+static uint32_t s_cable_epoch = 0;
 
 /* Single-slot observer — NULL if no observer is registered */
 static z906_state_change_cb_t s_change_observer = NULL;
@@ -95,6 +97,7 @@ void z906_state_init(void)
     s_current_state.main_state_valid      = false; /* No status frame received */
     s_last_main_status_time_us             = 0;
     s_last_matched_status_time_us          = 0;
+    s_cable_epoch                          = 0;
 
     ESP_LOGI(TAG, "Z906 state store initialized with defaults");
 }
@@ -386,6 +389,9 @@ void z906_state_set_cable_status(bool connected)
         s_current_state.is_operational  = connected;
         changed = true;
     }
+    if (changed) {
+        ++s_cable_epoch; /* Even if the EventBus cable event is dropped. */
+    }
     if (changed || !connected) {
         /* Each physical cable epoch requires a new verified CONFIG frame.
          * Reset both on disconnect and reconnect, never reuse old state. */
@@ -400,6 +406,35 @@ void z906_state_set_cable_status(bool connected)
     if (changed) {
         prv_notify_observer((1UL << 17) - 1UL); /* All 17 attribute bits */
     }
+}
+
+uint32_t z906_state_get_cable_epoch(void)
+{
+    if (s_state_mutex == NULL) {
+        return 0;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    uint32_t epoch = s_cable_epoch;
+    xSemaphoreGive(s_state_mutex);
+    return epoch;
+}
+
+bool z906_state_confirm_main_for_epoch(uint32_t epoch)
+{
+    if (s_state_mutex == NULL) {
+        return false;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool accepted = s_current_state.cable_connected && s_cable_epoch == epoch;
+    if (accepted) {
+        s_current_state.main_state_valid = true;
+        s_last_main_status_time_us = esp_timer_get_time();
+    }
+    xSemaphoreGive(s_state_mutex);
+    if (accepted) {
+        prv_notify_observer((1UL << 17) - 1UL);
+    }
+    return accepted;
 }
 
 void z906_state_set_main_valid(bool valid)

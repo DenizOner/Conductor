@@ -40,6 +40,10 @@ typedef struct {
     } data;
     /* Amplifier RX monotonic first-byte time; zero for other event types. */
     int64_t received_at_us;
+    /* RX bytes carry their ingest-time cable and stream generation. Cable
+     * events are advisory; FSM must not depend on queue delivery for safety. */
+    uint32_t cable_epoch;
+    uint32_t rx_stream_epoch;
 } z906_event_t;
 
 /**

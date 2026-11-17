@@ -26,6 +26,7 @@
 #include "uart_hal.h"
 #include "event_bus.h"
 #include "wdt_manager.h"
+#include "z906_state.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -92,6 +93,8 @@ static void prv_uart_rx_task(void *pvParameters)
     xSemaphoreGive(s_started_sem);
 
     uint8_t rx_byte = 0;
+    uint32_t last_cable_epoch = z906_state_get_cable_epoch();
+    uint32_t amp_stream_epoch = 0;
 
     while (1) {
         wdt_manager_reset();
@@ -105,14 +108,29 @@ static void prv_uart_rx_task(void *pvParameters)
             event_bus_post(&evt, 0);
         }
 
-        /* Drain one byte from the Amplifier channel and post to EventBus */
+        /* A cable transition invalidates the hardware RX ring even if the
+         * cable notification was dropped from the (bounded) EventBus.
+         * Flush only at the boundary: normal console passthrough is unchanged. */
+        uint32_t read_epoch = z906_state_get_cable_epoch();
+        if (read_epoch != last_cable_epoch) {
+            z906_uart_hal_flush_amp_rx();
+            last_cable_epoch = read_epoch;
+            ++amp_stream_epoch;
+        }
+        /* Stamp the epoch BEFORE a potentially blocking UART read. If cable
+         * changes mid-read, FSM will reject state from this old generation. */
         if (z906_uart_hal_read_amp(&rx_byte, 1, pdMS_TO_TICKS(5)) > 0) {
             z906_event_t evt = {
                 .type = EVENT_AMP_RX_BYTE,
                 .data = { .raw_byte = rx_byte },
-                .received_at_us = esp_timer_get_time()
+                .received_at_us = esp_timer_get_time(),
+                .cable_epoch = read_epoch,
+                .rx_stream_epoch = amp_stream_epoch
             };
-            event_bus_post(&evt, 0);
+            if (!event_bus_post(&evt, 0)) {
+                /* Dropped bytes cannot silently continue an in-flight frame. */
+                ++amp_stream_epoch;
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(5));
