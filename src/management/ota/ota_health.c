@@ -41,6 +41,9 @@ static ota_health_bool_fn_t s_zigbee_ready_fn_for_test = NULL;
 static ota_health_bool_fn_t s_nvs_healthy_fn_for_test = NULL;
 static ota_health_bool_fn_t s_twdt_healthy_fn_for_test = NULL;
 static bool s_telemetry_twdt_feed_ok = false;
+static bool s_finalization_in_progress = false;
+/* Short state snapshots only: SDK / NVS / OTA APIs are NEVER called under this spinlock. */
+static portMUX_TYPE s_health_mux = portMUX_INITIALIZER_UNLOCKED;
 static ota_health_bool_fn_t s_fallback_available_fn_for_test = NULL;
 
 static int64_t ota_health_now_us(void)
@@ -66,6 +69,7 @@ bool ota_health_init(void)
     s_criteria = (ota_health_criteria_t){ 0 };
     s_is_pending_verify = false;
     s_rollback_handled = false;
+    s_finalization_in_progress = false;
     s_validation_start_us = 0;
     evaluate_criteria();
 
@@ -113,46 +117,49 @@ bool ota_health_init(void)
 
 static void evaluate_criteria(void)
 {
-    /* Current health evaluation — NOT latched (Model A: CURRENT HEALTH) */
-    s_criteria.scheduler_healthy = (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING);
-    /* The current owner must be subscribed and successfully fed this cycle.
-     * This is NOT an assertion about every other TWDT-subscribed task. */
-    s_criteria.watchdog_healthy = s_twdt_healthy_fn_for_test != NULL
+    ota_health_criteria_t sample = { 0 };
+    sample.scheduler_healthy = (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING);
+
+    portENTER_CRITICAL(&s_health_mux);
+    bool owner_fed = s_telemetry_twdt_feed_ok;
+    portEXIT_CRITICAL(&s_health_mux);
+    /* Current task = telemetry owner in the only production health cycle.
+     * CLI diagnostics must never call evaluate_criteria(). */
+    sample.watchdog_healthy = s_twdt_healthy_fn_for_test != NULL
         ? s_twdt_healthy_fn_for_test()
-        : (wdt_manager_is_initialized() &&
-           !wdt_manager_was_watchdog_reset() &&
-           s_telemetry_twdt_feed_ok &&
-           wdt_manager_is_current_task_registered());
+        : (wdt_manager_is_initialized() && !wdt_manager_was_watchdog_reset() &&
+           owner_fed && wdt_manager_is_current_task_registered());
 
-    /* 2. Read-only NVS probe: missing optional key != flash error. */
-    s_criteria.nvs_healthy = s_nvs_healthy_fn_for_test != NULL
-        ? s_nvs_healthy_fn_for_test()
-        : nvs_manager_check_read_health();
+    sample.nvs_healthy = s_nvs_healthy_fn_for_test != NULL
+        ? s_nvs_healthy_fn_for_test() : nvs_manager_check_read_health();
 
-    /* Network joining is not required for native Zigbee stack readiness. */
-    s_criteria.zigbee_healthy = s_zigbee_ready_fn_for_test != NULL
+    sample.zigbee_healthy = s_zigbee_ready_fn_for_test != NULL
         ? s_zigbee_ready_fn_for_test()
         : (zigbee_native_stack_get_state() == ZB_STACK_STATE_RUNNING &&
            zigbee_device_model_is_registered());
 
-    /* A verified CONFIG frame must be received AFTER pending validation starts
-     * and still be fresh near the 15-second decision. A one-off boot reply
-     * cannot prove the amplifier remains responsive for the OTA window. */
     int64_t now_us = ota_health_now_us();
-    int64_t status_us = (s_status_time_fn_for_test != NULL)
+    int64_t status_us = s_status_time_fn_for_test != NULL
         ? s_status_time_fn_for_test()
         : z906_state_get_matched_status_reply_time_us();
-    s_criteria.z906_comm_healthy = z906_state_is_main_valid() &&
+    sample.z906_comm_healthy = z906_state_is_main_valid() &&
         status_us > s_validation_start_us &&
         status_us <= now_us &&
         (now_us - status_us) <= OTA_Z906_STATUS_MAX_AGE_US;
 
+    portENTER_CRITICAL(&s_health_mux);
+    s_criteria = sample;
     ota_health_refresh_mask_from_criteria();
+    portEXIT_CRITICAL(&s_health_mux);
 }
 
 void ota_health_process_cycle(uint32_t elapsed_sec)
 {
-    if (!s_is_pending_verify || s_is_validated || s_rollback_handled) {
+    portENTER_CRITICAL(&s_health_mux);
+    bool can_evaluate = s_is_pending_verify && !s_is_validated &&
+                        !s_rollback_handled && !s_finalization_in_progress;
+    portEXIT_CRITICAL(&s_health_mux);
+    if (!can_evaluate) {
         return;
     }
 
@@ -164,17 +171,19 @@ void ota_health_process_cycle(uint32_t elapsed_sec)
     }
     s_seconds_in_validation = (uint32_t)(elapsed_us / 1000000LL);
     evaluate_criteria();
+    ota_health_criteria_t sample;
+    ota_health_get_criteria(&sample);
 
-    bool all_criteria_met = s_criteria.scheduler_healthy &&
-                            s_criteria.watchdog_healthy &&
-                            s_criteria.nvs_healthy &&
-                            s_criteria.zigbee_healthy &&
-                            s_criteria.z906_comm_healthy;
+    bool all_criteria_met = sample.scheduler_healthy &&
+                            sample.watchdog_healthy &&
+                            sample.nvs_healthy &&
+                            sample.zigbee_healthy &&
+                            sample.z906_comm_healthy;
 
     if (!all_criteria_met) {
         ESP_LOGW(TAG, "Health check criteria not satisfied yet: Sched=%d, WDT=%d, NVS=%d, ZB=%d, Z906=%d (Elapsed: %lu s)",
-                 s_criteria.scheduler_healthy, s_criteria.watchdog_healthy,
-                 s_criteria.nvs_healthy, s_criteria.zigbee_healthy, s_criteria.z906_comm_healthy,
+                 sample.scheduler_healthy, sample.watchdog_healthy,
+                 sample.nvs_healthy, sample.zigbee_healthy, sample.z906_comm_healthy,
                  (unsigned long)s_seconds_in_validation);
 
         if (s_seconds_in_validation >= OTA_HEALTH_VALIDATION_WINDOW_S) {
@@ -186,21 +195,36 @@ void ota_health_process_cycle(uint32_t elapsed_sec)
     }
 
     if (s_seconds_in_validation >= OTA_HEALTH_VALIDATION_WINDOW_S) {
-        ESP_LOGI(TAG, "=========================================================");
-        ESP_LOGI(TAG, "HEALTH CHECK PASSED! All 5 subsystem criteria verified.");
-        ESP_LOGI(TAG, "Marking application as permanently VALID in otadata...");
+        /* CLI manual rollback and telemetry automatic approval are mutually
+         * exclusive even if scheduled on different FreeRTOS tasks. */
+        portENTER_CRITICAL(&s_health_mux);
+        bool claimed = s_is_pending_verify && !s_is_validated &&
+                       !s_rollback_handled && !s_finalization_in_progress;
+        if (claimed) {
+            s_finalization_in_progress = true;
+        }
+        portEXIT_CRITICAL(&s_health_mux);
+        if (!claimed) {
+            return;
+        }
 
-        esp_err_t err = (s_mark_valid_fn_for_test != NULL)
-                         ? s_mark_valid_fn_for_test()
-                         : esp_ota_mark_app_valid_cancel_rollback();
+        ESP_LOGI(TAG, "HEALTH CHECK PASSED! All 5 subsystem criteria verified.");
+        esp_err_t err = s_mark_valid_fn_for_test != NULL
+            ? s_mark_valid_fn_for_test()
+            : esp_ota_mark_app_valid_cancel_rollback();
+        portENTER_CRITICAL(&s_health_mux);
         if (err == ESP_OK) {
             s_is_validated = true;
             s_is_pending_verify = false;
+        }
+        s_finalization_in_progress = false;
+        portEXIT_CRITICAL(&s_health_mux);
+        if (err == ESP_OK) {
             ESP_LOGI(TAG, "SUCCESS: Firmware upgrade permanently COMMITTED!");
-            ESP_LOGI(TAG, "=========================================================");
             led_notification_post_cmd_result(true);
         } else {
-            ESP_LOGE(TAG, "Failed to mark app as valid: %s. Initiating rollback!", esp_err_to_name(err));
+            ESP_LOGE(TAG, "Failed to mark app as valid: %s; initiating rollback",
+                     esp_err_to_name(err));
             ota_health_trigger_rollback("esp_ota_mark_app_valid failed");
         }
     } else {
@@ -211,15 +235,23 @@ void ota_health_process_cycle(uint32_t elapsed_sec)
 
 bool ota_health_is_pending_verify(void)
 {
-    return s_is_pending_verify;
+    portENTER_CRITICAL(&s_health_mux);
+    bool pending = s_is_pending_verify;
+    portEXIT_CRITICAL(&s_health_mux);
+    return pending;
 }
 
 void ota_health_trigger_rollback(const char *reason)
 {
-    if (s_rollback_handled) {
+    portENTER_CRITICAL(&s_health_mux);
+    bool already_handled = s_rollback_handled || s_finalization_in_progress;
+    if (!already_handled) {
+        s_rollback_handled = true;
+    }
+    portEXIT_CRITICAL(&s_health_mux);
+    if (already_handled) {
         return;
     }
-    s_rollback_handled = true;
     ESP_LOGE(TAG, "OTA health failed: %s", reason ? reason : "Unknown");
     led_notification_post_cmd_result(false);
 
@@ -248,49 +280,72 @@ void ota_health_trigger_rollback(const char *reason)
 void ota_health_get_criteria(ota_health_criteria_t *out_criteria)
 {
     if (out_criteria != NULL) {
-        evaluate_criteria();
+        /* Never evaluate health from CLI context: that would check the CLI task's
+         * TWDT registration rather than the telemetry owner and mutate state. */
+        portENTER_CRITICAL(&s_health_mux);
         *out_criteria = s_criteria;
+        portEXIT_CRITICAL(&s_health_mux);
     }
 }
 
 uint32_t ota_health_get_passed_criteria_mask(void)
 {
-    return s_passed_criteria_mask;
+    portENTER_CRITICAL(&s_health_mux);
+    uint32_t mask = s_passed_criteria_mask;
+    portEXIT_CRITICAL(&s_health_mux);
+    return mask;
 }
 
 void ota_health_report_scheduler_ok(void)
 {
+    /* Legacy diagnostics only; periodic evaluated criteria remain authoritative. */
+    portENTER_CRITICAL(&s_health_mux);
     s_criteria.scheduler_healthy = true;
     ota_health_refresh_mask_from_criteria();
+    portEXIT_CRITICAL(&s_health_mux);
 }
 
 void ota_health_report_nvs_ok(void)
 {
+    /* Legacy diagnostics only; periodic evaluated criteria remain authoritative. */
+    portENTER_CRITICAL(&s_health_mux);
     s_criteria.nvs_healthy = true;
     ota_health_refresh_mask_from_criteria();
+    portEXIT_CRITICAL(&s_health_mux);
 }
 
 void ota_health_report_twdt_observation(bool fed)
 {
+    portENTER_CRITICAL(&s_health_mux);
     s_telemetry_twdt_feed_ok = fed;
+    portEXIT_CRITICAL(&s_health_mux);
 }
 
 void ota_health_report_twdt_ok(void)
 {
+    /* Legacy diagnostics only; periodic evaluated criteria remain authoritative. */
+    portENTER_CRITICAL(&s_health_mux);
     s_criteria.watchdog_healthy = true;
     ota_health_refresh_mask_from_criteria();
+    portEXIT_CRITICAL(&s_health_mux);
 }
 
 void ota_health_report_zigbee_ok(void)
 {
+    /* Legacy diagnostics only; periodic evaluated criteria remain authoritative. */
+    portENTER_CRITICAL(&s_health_mux);
     s_criteria.zigbee_healthy = true;
     ota_health_refresh_mask_from_criteria();
+    portEXIT_CRITICAL(&s_health_mux);
 }
 
 void ota_health_report_z906_comm_ok(void)
 {
+    /* Legacy diagnostics only; periodic evaluated criteria remain authoritative. */
+    portENTER_CRITICAL(&s_health_mux);
     s_criteria.z906_comm_healthy = true;
     ota_health_refresh_mask_from_criteria();
+    portEXIT_CRITICAL(&s_health_mux);
 }
 
 bool ota_health_was_rollback_detected(void)
@@ -300,7 +355,10 @@ bool ota_health_was_rollback_detected(void)
 
 bool ota_health_is_validated(void)
 {
-    return s_is_validated;
+    portENTER_CRITICAL(&s_health_mux);
+    bool validated = s_is_validated;
+    portEXIT_CRITICAL(&s_health_mux);
+    return validated;
 }
 
 void ota_health_set_pending_verify_for_test(bool pending)
@@ -309,6 +367,7 @@ void ota_health_set_pending_verify_for_test(bool pending)
     s_is_validated = false;
     s_seconds_in_validation = 0;
     s_rollback_handled = false;
+    s_finalization_in_progress = false;
     s_validation_start_us = ota_health_now_us();
 }
 
@@ -359,6 +418,7 @@ void ota_health_reset_for_test(void)
     s_seconds_in_validation = 0;
     s_validation_start_us = 0;
     s_rollback_handled = false;
+    s_finalization_in_progress = false;
     s_rollback_detected = false;
     s_time_fn_for_test = NULL;
     s_status_time_fn_for_test = NULL;
