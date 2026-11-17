@@ -28,11 +28,12 @@ int64_t esp_timer_get_time(void);
 """,
     "esp_log.h": """
 #pragma once
-#include <stdio.h>
-#define ESP_LOGI(tag, fmt, ...) do { (void)(tag); if (0) fprintf(stderr, fmt, ##__VA_ARGS__); } while (0)
-#define ESP_LOGW(tag, fmt, ...) do { (void)(tag); if (0) fprintf(stderr, fmt, ##__VA_ARGS__); } while (0)
-#define ESP_LOGE(tag, fmt, ...) do { (void)(tag); if (0) fprintf(stderr, fmt, ##__VA_ARGS__); } while (0)
-#define ESP_LOGD(tag, fmt, ...) do { (void)(tag); if (0) fprintf(stderr, fmt, ##__VA_ARGS__); } while (0)
+/* Preserve argument use without imposing host printf type assumptions. */
+void host_log_never_called(const char *, ...);
+#define ESP_LOGI(tag, fmt, ...) do { (void)(tag); if (0) host_log_never_called(fmt, ##__VA_ARGS__); } while (0)
+#define ESP_LOGW(tag, fmt, ...) do { (void)(tag); if (0) host_log_never_called(fmt, ##__VA_ARGS__); } while (0)
+#define ESP_LOGE(tag, fmt, ...) do { (void)(tag); if (0) host_log_never_called(fmt, ##__VA_ARGS__); } while (0)
+#define ESP_LOGD(tag, fmt, ...) do { (void)(tag); if (0) host_log_never_called(fmt, ##__VA_ARGS__); } while (0)
 """,
     "freertos/FreeRTOS.h": """
 #pragma once
@@ -90,6 +91,20 @@ void telemetry_notify_response_received(telemetry_query_id_t, int64_t);
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+typedef enum {
+    Z906_INPUT_SIX_CHANNEL_DIRECT = 1,
+    Z906_INPUT_RCA_STEREO = 2,
+    Z906_INPUT_OPTICAL_1 = 3,
+    Z906_INPUT_OPTICAL_2 = 4,
+    Z906_INPUT_DIGITAL_COAXIAL = 5,
+    Z906_INPUT_AUXILIARY = 6
+} z906_input_t;
+typedef enum {
+    Z906_EFFECT_3D = 0,
+    Z906_EFFECT_2_1 = 1,
+    Z906_EFFECT_4_1 = 2,
+    Z906_EFFECT_NONE = 3
+} z906_effect_t;
 #include "z906_commands.h"
 typedef struct {
     bool cable_connected, power, mute;
