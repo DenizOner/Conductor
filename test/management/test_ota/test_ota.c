@@ -291,6 +291,8 @@ void test_ota_health_transition_b_healthy_to_unhealthy_triggers_rollback(void)
         "Transition B: Subsystem failure during observation window MUST trigger rollback");
     TEST_ASSERT_FALSE_MESSAGE(ota_health_is_validated(),
         "Firmware must NOT be validated when subsystem fails");
+    TEST_ASSERT_EQUAL(OTA_HEALTH_RECOVERY_REQUESTED,
+                      ota_health_get_recovery_state());
 }
 
 /**
@@ -403,6 +405,8 @@ void test_ota_without_fallback_stays_pending(void)
     TEST_ASSERT_EQUAL_INT(0, s_rollback_call_count);
     TEST_ASSERT_FALSE(ota_health_is_validated());
     TEST_ASSERT_TRUE(ota_health_is_pending_verify());
+    TEST_ASSERT_EQUAL(OTA_HEALTH_RECOVERY_NO_FALLBACK,
+                      ota_health_get_recovery_state());
 }
 
 /** @brief An authenticated CONFIG frame during the window permits validation. */
