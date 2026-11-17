@@ -123,6 +123,7 @@ void ota_health_set_pending_verify_for_test(bool pending);
 void ota_health_set_time_fn_for_test(ota_health_time_fn_t fn);
 void ota_health_set_z906_status_time_fn_for_test(ota_health_time_fn_t fn);
 void ota_health_set_zigbee_ready_fn_for_test(ota_health_bool_fn_t fn);
+void ota_health_set_nvs_healthy_fn_for_test(ota_health_bool_fn_t fn);
 void ota_health_set_fallback_available_fn_for_test(ota_health_bool_fn_t fn);
 void ota_health_set_rollback_fn_for_test(ota_rollback_fn_t fn);
 void ota_health_set_mark_valid_fn_for_test(ota_mark_valid_fn_t fn);

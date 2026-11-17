@@ -38,6 +38,7 @@ static ota_mark_valid_fn_t s_mark_valid_fn_for_test = NULL;
 static ota_health_time_fn_t s_time_fn_for_test = NULL;
 static ota_health_time_fn_t s_status_time_fn_for_test = NULL;
 static ota_health_bool_fn_t s_zigbee_ready_fn_for_test = NULL;
+static ota_health_bool_fn_t s_nvs_healthy_fn_for_test = NULL;
 static ota_health_bool_fn_t s_fallback_available_fn_for_test = NULL;
 
 static int64_t ota_health_now_us(void)
@@ -114,9 +115,10 @@ static void evaluate_criteria(void)
     s_criteria.scheduler_healthy = (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING);
     s_criteria.watchdog_healthy  = wdt_manager_is_initialized() && !wdt_manager_was_watchdog_reset();
 
-    /* 2. NVS storage health (valid read without flash partition corruption) */
-    bool verif_en = true;
-    s_criteria.nvs_healthy       = nvs_manager_get_cmd_verifier_enabled(&verif_en);
+    /* 2. Read-only NVS probe: missing optional key != flash error. */
+    s_criteria.nvs_healthy = s_nvs_healthy_fn_for_test != NULL
+        ? s_nvs_healthy_fn_for_test()
+        : nvs_manager_check_read_health();
 
     /* Network joining is not required for native Zigbee stack readiness. */
     s_criteria.zigbee_healthy = s_zigbee_ready_fn_for_test != NULL
@@ -311,6 +313,11 @@ void ota_health_set_zigbee_ready_fn_for_test(ota_health_bool_fn_t fn)
     s_zigbee_ready_fn_for_test = fn;
 }
 
+void ota_health_set_nvs_healthy_fn_for_test(ota_health_bool_fn_t fn)
+{
+    s_nvs_healthy_fn_for_test = fn;
+}
+
 void ota_health_set_fallback_available_fn_for_test(ota_health_bool_fn_t fn)
 {
     s_fallback_available_fn_for_test = fn;
@@ -337,6 +344,7 @@ void ota_health_reset_for_test(void)
     s_time_fn_for_test = NULL;
     s_status_time_fn_for_test = NULL;
     s_zigbee_ready_fn_for_test = NULL;
+    s_nvs_healthy_fn_for_test = NULL;
     s_fallback_available_fn_for_test = NULL;
     s_rollback_fn_for_test = NULL;
     s_mark_valid_fn_for_test = NULL;

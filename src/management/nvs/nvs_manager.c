@@ -324,6 +324,31 @@ bool nvs_manager_clear_zb_net_info(void)
     return true;
 }
 
+bool nvs_manager_check_read_health(void)
+{
+    /* Missing namespace/key on a virgin device is not a flash fault.
+     * Real NVS open/read/type errors must prevent post-OTA confirmation.
+     * No NVS mutation occurs in this probe. */
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE_ZB, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return true;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS health probe open failed (err: 0x%x)", err);
+        return false;
+    }
+
+    uint8_t verifier_enabled = 1;
+    err = nvs_get_u8(handle, NVS_KEY_VERIF_EN, &verifier_enabled);
+    nvs_close(handle);
+    if (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND) {
+        return true;
+    }
+    ESP_LOGE(TAG, "NVS health probe read failed (err: 0x%x)", err);
+    return false;
+}
+
 bool nvs_manager_get_cmd_verifier_enabled(bool *out_enabled)
 {
     /* Validate output pointer parameter */
