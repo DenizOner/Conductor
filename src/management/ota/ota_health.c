@@ -22,6 +22,7 @@
 static const char *TAG = "OTA_HEALTH";
 
 #define OTA_HEALTH_VALIDATION_WINDOW_S  15
+#define OTA_Z906_STATUS_MAX_AGE_US     (5000000LL)
 
 static bool s_is_pending_verify = false;
 static bool s_rollback_detected = false;
@@ -35,6 +36,7 @@ static ota_health_criteria_t s_criteria = { 0 };
 static ota_rollback_fn_t s_rollback_fn_for_test = NULL;
 static ota_mark_valid_fn_t s_mark_valid_fn_for_test = NULL;
 static ota_health_time_fn_t s_time_fn_for_test = NULL;
+static ota_health_time_fn_t s_status_time_fn_for_test = NULL;
 static ota_health_bool_fn_t s_zigbee_ready_fn_for_test = NULL;
 static ota_health_bool_fn_t s_fallback_available_fn_for_test = NULL;
 
@@ -122,9 +124,17 @@ static void evaluate_criteria(void)
         : (zigbee_native_stack_get_state() == ZB_STACK_STATE_RUNNING &&
            zigbee_device_model_is_registered());
 
-    /* A verified CONFIG frame received during this boot plus cable presence
-     * is the minimum physical Z906 health signal; default volume is not. */
-    s_criteria.z906_comm_healthy = z906_state_is_main_valid();
+    /* A verified CONFIG frame must be received AFTER pending validation starts
+     * and still be fresh near the 15-second decision. A one-off boot reply
+     * cannot prove the amplifier remains responsive for the OTA window. */
+    int64_t now_us = ota_health_now_us();
+    int64_t status_us = (s_status_time_fn_for_test != NULL)
+        ? s_status_time_fn_for_test()
+        : z906_state_get_main_status_time_us();
+    s_criteria.z906_comm_healthy = z906_state_is_main_valid() &&
+        status_us > s_validation_start_us &&
+        status_us <= now_us &&
+        (now_us - status_us) <= OTA_Z906_STATUS_MAX_AGE_US;
 
     ota_health_refresh_mask_from_criteria();
 }
@@ -291,6 +301,11 @@ void ota_health_set_time_fn_for_test(ota_health_time_fn_t fn)
     s_time_fn_for_test = fn;
 }
 
+void ota_health_set_z906_status_time_fn_for_test(ota_health_time_fn_t fn)
+{
+    s_status_time_fn_for_test = fn;
+}
+
 void ota_health_set_zigbee_ready_fn_for_test(ota_health_bool_fn_t fn)
 {
     s_zigbee_ready_fn_for_test = fn;
@@ -320,6 +335,7 @@ void ota_health_reset_for_test(void)
     s_rollback_handled = false;
     s_rollback_detected = false;
     s_time_fn_for_test = NULL;
+    s_status_time_fn_for_test = NULL;
     s_zigbee_ready_fn_for_test = NULL;
     s_fallback_available_fn_for_test = NULL;
     s_rollback_fn_for_test = NULL;

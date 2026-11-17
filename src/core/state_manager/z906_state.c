@@ -22,6 +22,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 static const char *TAG = "STATE_MGR";
 
@@ -32,6 +33,8 @@ static const char *TAG = "STATE_MGR";
 static z906_state_t      s_current_state;
 static SemaphoreHandle_t s_state_mutex  = NULL;
 static StaticSemaphore_t s_mutex_buffer;
+/* Protected by s_state_mutex after init; updated only by verified CONFIG frames. */
+static int64_t s_last_main_status_time_us = 0;
 
 /* Single-slot observer — NULL if no observer is registered */
 static z906_state_change_cb_t s_change_observer = NULL;
@@ -88,6 +91,7 @@ void z906_state_init(void)
     s_current_state.cable_connected       = false;
     s_current_state.is_operational        = false;
     s_current_state.main_state_valid      = false; /* No status frame received */
+    s_last_main_status_time_us             = 0;
 
     ESP_LOGI(TAG, "Z906 state store initialized with defaults");
 }
@@ -383,6 +387,7 @@ void z906_state_set_cable_status(bool connected)
         /* Invalidate verified measurements on cable loss */
         s_current_state.main_state_valid = false;
         s_current_state.temp_valid       = false;
+        s_last_main_status_time_us       = 0;
     }
     xSemaphoreGive(s_state_mutex);
 
@@ -396,10 +401,23 @@ void z906_state_set_main_valid(bool valid)
 {
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     s_current_state.main_state_valid = valid;
+    s_last_main_status_time_us = valid ? esp_timer_get_time() : 0;
     xSemaphoreGive(s_state_mutex);
 
     /* Notify all hardware attributes — first verified frame is special */
     prv_notify_observer((1UL << 17) - 1UL);
+}
+
+int64_t z906_state_get_main_status_time_us(void)
+{
+    if (s_state_mutex == NULL) {
+        return 0;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    int64_t timestamp = (s_current_state.main_state_valid && s_current_state.cable_connected)
+        ? s_last_main_status_time_us : 0;
+    xSemaphoreGive(s_state_mutex);
+    return timestamp;
 }
 
 bool z906_state_is_main_valid(void)

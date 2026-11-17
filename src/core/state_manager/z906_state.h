@@ -194,6 +194,13 @@ void z906_state_set_main_valid(bool valid);
 bool z906_state_is_main_valid(void);
 
 /**
+ * @brief Monotonic timestamp of the last integrity-verified CONFIG frame.
+ * @return Microseconds from esp_timer_get_time(), or 0 when cable/status is invalid.
+ *         Serialized by the existing state mutex; no dynamic allocations.
+ */
+int64_t z906_state_get_main_status_time_us(void);
+
+/**
  * @brief Callback type for state change observers.
  *
  * Called from within the state mutex immediately after any attribute changes.
