@@ -130,7 +130,7 @@ static void evaluate_criteria(void)
     int64_t now_us = ota_health_now_us();
     int64_t status_us = (s_status_time_fn_for_test != NULL)
         ? s_status_time_fn_for_test()
-        : z906_state_get_main_status_time_us();
+        : z906_state_get_matched_status_reply_time_us();
     s_criteria.z906_comm_healthy = z906_state_is_main_valid() &&
         status_us > s_validation_start_us &&
         status_us <= now_us &&

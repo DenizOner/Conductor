@@ -35,6 +35,8 @@ static SemaphoreHandle_t s_state_mutex  = NULL;
 static StaticSemaphore_t s_mutex_buffer;
 /* Protected by s_state_mutex after init; updated only by verified CONFIG frames. */
 static int64_t s_last_main_status_time_us = 0;
+/* Only an in-window reply to a telemetry STATUS request is OTA evidence. */
+static int64_t s_last_matched_status_time_us = 0;
 
 /* Single-slot observer — NULL if no observer is registered */
 static z906_state_change_cb_t s_change_observer = NULL;
@@ -92,6 +94,7 @@ void z906_state_init(void)
     s_current_state.is_operational        = false;
     s_current_state.main_state_valid      = false; /* No status frame received */
     s_last_main_status_time_us             = 0;
+    s_last_matched_status_time_us          = 0;
 
     ESP_LOGI(TAG, "Z906 state store initialized with defaults");
 }
@@ -389,6 +392,7 @@ void z906_state_set_cable_status(bool connected)
         s_current_state.main_state_valid = false;
         s_current_state.temp_valid       = false;
         s_last_main_status_time_us       = 0;
+        s_last_matched_status_time_us    = 0;
     }
     xSemaphoreGive(s_state_mutex);
 
@@ -405,10 +409,39 @@ void z906_state_set_main_valid(bool valid)
     bool accepted = valid && s_current_state.cable_connected;
     s_current_state.main_state_valid = accepted;
     s_last_main_status_time_us = accepted ? esp_timer_get_time() : 0;
+    if (!accepted) {
+        s_last_matched_status_time_us = 0;
+    }
     xSemaphoreGive(s_state_mutex);
 
     /* Notify all hardware attributes — first verified frame is special */
     prv_notify_observer((1UL << 17) - 1UL);
+}
+
+void z906_state_note_matched_status_reply(int64_t response_time_us)
+{
+    if (s_state_mutex == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (s_current_state.main_state_valid && s_current_state.cable_connected &&
+        response_time_us > 0 &&
+        response_time_us >= s_last_main_status_time_us) {
+        s_last_matched_status_time_us = response_time_us;
+    }
+    xSemaphoreGive(s_state_mutex);
+}
+
+int64_t z906_state_get_matched_status_reply_time_us(void)
+{
+    if (s_state_mutex == NULL) {
+        return 0;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    int64_t confirmed = (s_current_state.main_state_valid && s_current_state.cable_connected)
+        ? s_last_matched_status_time_us : 0;
+    xSemaphoreGive(s_state_mutex);
+    return confirmed;
 }
 
 int64_t z906_state_get_main_status_time_us(void)

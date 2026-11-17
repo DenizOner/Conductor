@@ -201,6 +201,16 @@ bool z906_state_is_main_valid(void);
 int64_t z906_state_get_main_status_time_us(void);
 
 /**
+ * @brief Records a status response matched to a live telemetry STATUS request.
+ * Called after verified CONFIG decoding, by the telemetry response owner only.
+ * @param response_time_us Monotonic reception time, or ignored if invalid.
+ */
+void z906_state_note_matched_status_reply(int64_t response_time_us);
+
+/** @brief Returns the last matched live STATUS reply timestamp, or 0 if invalid. */
+int64_t z906_state_get_matched_status_reply_time_us(void);
+
+/**
  * @brief Callback type for state change observers.
  *
  * Called from within the state mutex immediately after any attribute changes.
