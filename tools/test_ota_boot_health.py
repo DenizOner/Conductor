@@ -88,6 +88,7 @@ bool zigbee_device_model_is_registered(void);
 #include <stdbool.h>
 bool z906_state_is_main_valid(void);
 int64_t z906_state_get_main_status_time_us(void);
+int64_t z906_state_get_matched_status_reply_time_us(void);
 """,
     "led_notification_manager.h": """
 #pragma once
@@ -134,6 +135,7 @@ zb_stack_state_t zigbee_native_stack_get_state(void) {
 bool zigbee_device_model_is_registered(void) { return s_zigbee_ok; }
 bool z906_state_is_main_valid(void) { return s_z906_ok; }
 int64_t z906_state_get_main_status_time_us(void) { return s_z906_ok ? s_status_at_us : 0; }
+int64_t z906_state_get_matched_status_reply_time_us(void) { return s_z906_ok ? s_status_at_us : 0; }
 void led_notification_post_cmd_result(bool success) { (void)success; }
 void ota_client_note_health_failure(const char *s) { (void)s; ++s_failure_count; }
 const char *esp_err_to_name(esp_err_t err) { (void)err; return "mock"; }
