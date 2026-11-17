@@ -33,6 +33,7 @@ int64_t esp_timer_get_time(void);
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 typedef uint32_t TickType_t;
 typedef int BaseType_t;
 #define pdTRUE 1
