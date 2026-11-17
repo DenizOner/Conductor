@@ -126,6 +126,10 @@ TEST = r"""
 #include <stdint.h>
 #include <stdio.h>
 #include "telemetry.h"
+#include "z906_state.h"
+#include "event_bus.h"
+#include "esp_timer.h"
+#include <stddef.h>
 
 static int64_t s_now = 1000000;
 static bool s_busy, s_connected = true, s_ota_pending;
