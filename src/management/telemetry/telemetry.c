@@ -339,6 +339,6 @@ bool telemetry_start(void)
     }
 
     ESP_LOGI(TAG, "telemetry_task STARTED (Priority %u, stack %u words)",
-             TELEMETRY_TASK_PRIORITY, TELEMETRY_TASK_STACK_WORDS);
+             TELEMETRY_TASK_PRIORITY, (unsigned int)TELEMETRY_TASK_STACK_WORDS);
     return true;
 }
