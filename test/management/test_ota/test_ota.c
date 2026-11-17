@@ -23,14 +23,23 @@ static const char *s_last_rollback_reason = NULL;
 static int64_t s_fake_time_us = 1000000;
 static bool s_fake_zigbee_ready = true;
 static bool s_fake_fallback_available = true;
+static bool s_auto_status_refresh = false;
+static unsigned s_status_tick_counter = 0;
+static int64_t s_fake_status_time_us = 0;
 
 static int64_t mock_health_time(void) { return s_fake_time_us; }
+static int64_t mock_status_time(void) { return s_fake_status_time_us; }
 static bool mock_zigbee_ready(void) { return s_fake_zigbee_ready; }
 static bool mock_fallback_available(void) { return s_fake_fallback_available; }
 
 static void advance_health_second(void)
 {
     s_fake_time_us += 1000000;
+    if (s_auto_status_refresh && ((s_status_tick_counter++ % 4U) == 0U)) {
+        /* Simulate one verified CONFIG frame for each 4-second OTA STATUS poll. */
+        z906_state_set_main_valid(true);
+        s_fake_status_time_us = s_fake_time_us;
+    }
     ota_health_process_cycle(1);
 }
 
@@ -57,7 +66,11 @@ void setUp(void)
     s_fake_time_us = 1000000;
     s_fake_zigbee_ready = true;
     s_fake_fallback_available = true;
+    s_auto_status_refresh = false;
+    s_status_tick_counter = 0;
+    s_fake_status_time_us = 0;
     ota_health_set_time_fn_for_test(mock_health_time);
+    ota_health_set_z906_status_time_fn_for_test(mock_status_time);
     ota_health_set_zigbee_ready_fn_for_test(mock_zigbee_ready);
     ota_health_set_fallback_available_fn_for_test(mock_fallback_available);
     s_rollback_call_count = 0;
@@ -225,7 +238,7 @@ void test_ota_health_transition_a_healthy_throughout_validates(void)
 {
     ota_health_set_rollback_fn_for_test(mock_rollback_fn);
     ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
-    z906_state_set_main_valid(true); /* Simulated verified CONFIG frame. */
+    s_auto_status_refresh = true;
     ota_health_set_pending_verify_for_test(true);
 
     /* 15 one-second evaluation cycles while all subsystems are healthy */
@@ -248,7 +261,7 @@ void test_ota_health_transition_b_healthy_to_unhealthy_triggers_rollback(void)
 {
     ota_health_set_rollback_fn_for_test(mock_rollback_fn);
     ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
-    z906_state_set_main_valid(true);
+    s_auto_status_refresh = true;
     ota_health_set_pending_verify_for_test(true);
 
     /* 5 seconds healthy */
@@ -281,7 +294,7 @@ void test_ota_health_transition_c_unhealthy_to_healthy_validates(void)
 {
     ota_health_set_rollback_fn_for_test(mock_rollback_fn);
     ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
-    z906_state_set_main_valid(true);
+    s_auto_status_refresh = true;
     ota_health_set_pending_verify_for_test(true);
 
     /* Start with transient fault */
@@ -314,7 +327,7 @@ void test_ota_health_transition_d_unhealthy_throughout_triggers_rollback(void)
 {
     ota_health_set_rollback_fn_for_test(mock_rollback_fn);
     ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
-    z906_state_set_main_valid(true);
+    s_auto_status_refresh = true;
     ota_health_set_pending_verify_for_test(true);
 
     /* Remains in failed state throughout */
@@ -346,9 +359,10 @@ void test_ota_cable_loss_revokes_health(void)
 {
     ota_health_set_rollback_fn_for_test(mock_rollback_fn);
     ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
-    z906_state_set_main_valid(true);
+    s_auto_status_refresh = true;
     ota_health_set_pending_verify_for_test(true);
     advance_health_second();
+    s_auto_status_refresh = false;
     z906_state_set_cable_status(false);
     for (int i = 1; i < 15; i++) {
         advance_health_second();
@@ -392,12 +406,43 @@ void test_ota_status_arrives_during_window(void)
     for (int i = 0; i < 5; i++) {
         advance_health_second();
     }
-    z906_state_set_main_valid(true);
+    s_auto_status_refresh = true;
     for (int i = 5; i < 15; i++) {
         advance_health_second();
     }
     TEST_ASSERT_EQUAL_INT(0, s_rollback_call_count);
     TEST_ASSERT_TRUE(ota_health_is_validated());
+}
+
+/** @brief The first CONFIG frame cannot be reused after communications stop. */
+void test_ota_stale_status_does_not_approve_image(void)
+{
+    ota_health_set_rollback_fn_for_test(mock_rollback_fn);
+    ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
+    ota_health_set_pending_verify_for_test(true);
+    s_auto_status_refresh = true;
+    advance_health_second();
+    s_auto_status_refresh = false;
+    for (int i = 1; i < 15; i++) {
+        advance_health_second();
+    }
+    TEST_ASSERT_EQUAL_INT(1, s_rollback_call_count);
+    TEST_ASSERT_FALSE(ota_health_is_validated());
+}
+
+/** @brief A pre-pending CONFIG frame is not evidence of OTA boot health. */
+void test_ota_status_before_pending_is_not_fresh(void)
+{
+    ota_health_set_rollback_fn_for_test(mock_rollback_fn);
+    ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
+    z906_state_set_main_valid(true);
+    s_fake_status_time_us = s_fake_time_us - 1000;
+    ota_health_set_pending_verify_for_test(true);
+    for (int i = 0; i < 15; i++) {
+        advance_health_second();
+    }
+    TEST_ASSERT_EQUAL_INT(1, s_rollback_call_count);
+    TEST_ASSERT_FALSE(ota_health_is_validated());
 }
 
 int runUnityTests(void)
@@ -420,6 +465,8 @@ int runUnityTests(void)
     RUN_TEST(test_ota_single_late_tick_cannot_bypass_validation);
     RUN_TEST(test_ota_without_fallback_stays_pending);
     RUN_TEST(test_ota_status_arrives_during_window);
+    RUN_TEST(test_ota_stale_status_does_not_approve_image);
+    RUN_TEST(test_ota_status_before_pending_is_not_fresh);
     return UNITY_END();
 }
 
