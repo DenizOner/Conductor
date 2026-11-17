@@ -42,6 +42,7 @@ jobs:
           python3 tools/test_nvs_health.py
           python3 tools/test_telemetry_query_host.py
           python3 tools/test_cable_epoch_host.py
+          python3 tools/test_transport_epoch_host.py
 
   build-firmware:
     name: Build Firmware Binary & Validate OTA
