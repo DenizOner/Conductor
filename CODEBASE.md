@@ -624,7 +624,7 @@ Firmware updates use the ZCL OTA Upgrade Cluster specification (`0x0019`) on Cli
 - Dual symmetrical 1,792 KB application partitions (`ota_0` and `ota_1`) prevent in-place overwrites.
 - The 15-second post-update observation window (`ota_health.c`) is serviced by the existing `telemetry_task` through `ota_client_process_cycle()` once per task iteration. Elapsed time is measured from `esp_timer_get_time()` at pending-verification initialization rather than counted from task ticks.
 - The five criteria are scheduler, WDT, NVS, native Zigbee stack `RUNNING` with registered endpoints (RF join is not required), and a verified Z906 CONFIG frame received since boot with the cable connected. A default volume value is not a health signal.
-- While the image is pending, telemetry queries Z906 status early under its existing verifier mutex instead of waiting for the normal approximately 20-second polling stage. Busy control traffic retains priority; there is no new task, heap allocation or UART bypass.
+- While the image is pending, telemetry queries Z906 status early **and every approximately 4 seconds** under its existing verifier mutex rather than waiting for normal approximately 20-second polling. The confirmed CONFIG timestamp is stored under the existing state mutex; the OTA decision requires a status frame newer than pending startup and no older than 5 seconds. Busy control traffic retains priority; there is no new task, heap allocation or UART bypass.
 - Failed verification rolls back only when a valid previous OTA image exists. If no usable fallback exists or rollback is rejected, the image is kept pending without a forced restart loop; it is never falsely marked valid.
 
 ---

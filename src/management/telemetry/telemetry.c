@@ -28,6 +28,8 @@ static telemetry_stat_t s_stats[TELEMETRY_QUERY_COUNT] = { 0 };
 static int s_pending_query_id = -1;
 static int64_t s_pending_dispatch_time_us = 0;
 #define TELEMETRY_TIMEOUT_US (2000000) /* 2.0 seconds timeout for amplifier response */
+#define OTA_STATUS_POLL_INTERVAL_US (4000000LL) /* Verified CONFIG no older than 5s */
+static int64_t s_last_ota_status_request_us = 0;
 
 static telemetry_query_id_t opcode_to_query_id(uint8_t opcode)
 {
@@ -129,15 +131,21 @@ void telemetry_process_cycle(void)
         }
     }
 
-    /* During pending OTA verification, obtain a fresh CONFIG frame inside
-     * the 15-second window (normal STATUS polling is around 20 seconds).
-     * Keep the existing verifier lock and user-command priority; retry on BUSY. */
-    if (ota_health_is_pending_verify() && !z906_state_is_main_valid()) {
-        if (s_pending_query_id < 0) {
-            (void)telemetry_dispatch_query(Z906_CMD_READ_STATUS);
+    /* While pending, poll STATUS approximately every 4 seconds, including AFTER
+     * the first valid CONFIG reply. The OTA health decision requires a recent
+     * response, not a sticky main_state_valid flag from earlier in the window.
+     * Reuse the verifier mutex, never preempt user commands or another query. */
+    if (ota_health_is_pending_verify()) {
+        if (s_pending_query_id < 0 &&
+            (s_last_ota_status_request_us == 0 ||
+             now - s_last_ota_status_request_us >= OTA_STATUS_POLL_INTERVAL_US)) {
+            if (telemetry_dispatch_query(Z906_CMD_READ_STATUS)) {
+                s_last_ota_status_request_us = now;
+            }
         }
         return;
     }
+    s_last_ota_status_request_us = 0;
 
     /* 3. Execute non-interfering sequential telemetry polling every 5 seconds (5 * 1000ms ticks) */
     s_cycle_counter++;
