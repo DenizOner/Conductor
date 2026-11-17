@@ -113,6 +113,7 @@ typedef struct {
 void z906_state_get(z906_state_t *);
 uint32_t z906_state_get_cable_epoch(void);
 bool z906_state_confirm_main_for_epoch(uint32_t);
+void z906_state_set_main_valid(bool);
 void z906_state_set_volume(uint8_t);
 void z906_state_set_trim(uint8_t, uint8_t);
 void z906_state_set_input(z906_input_t);
@@ -145,6 +146,7 @@ static bool s_drop_cable_events;
 static z906_state_t s_state = { .cable_connected = true };
 static uint32_t s_epoch = 1;
 static unsigned s_confirmed, s_ota_replies, s_forwarded;
+static unsigned s_invalidations, s_input_updates;
 
 static const uint8_t s_payload[20] = {
     10, 21, 21, 21, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 6, 1, 3, 0, 0, 0
@@ -167,6 +169,9 @@ bool event_bus_receive(z906_event_t *event, TickType_t wait) {
 }
 uint32_t z906_state_get_cable_epoch(void) { return s_epoch; }
 void z906_state_get(z906_state_t *out) { *out = s_state; }
+void z906_state_set_main_valid(bool valid) {
+    assert(!valid); ++s_invalidations;
+}
 bool z906_state_confirm_main_for_epoch(uint32_t e) {
     if (!s_state.cable_connected || e != s_epoch) return false;
     ++s_confirmed;
@@ -178,7 +183,7 @@ void z906_state_set_trim(uint8_t i, uint8_t v) {
     else if (i == 1) s_state.volume_center = v;
     else s_state.volume_rear = v;
 }
-void z906_state_set_input(z906_input_t i) { (void)i; }
+void z906_state_set_input(z906_input_t i) { (void)i; ++s_input_updates; }
 void z906_state_set_effect(z906_effect_t e) { (void)e; }
 void z906_state_set_mute(bool v) { s_state.mute = v; }
 void z906_state_set_digital_signal_status(uint8_t v) { (void)v; }
@@ -253,13 +258,17 @@ int main(void) {
     assert(s_confirmed == 1 && s_ota_replies == 1);
     assert(s_forwarded == 48);
 
-    /* A lost RX byte changes stream generation: no cross-gap frame. */
+    /* A lost RX byte changes stream generation: no cross-gap frame and
+     * no orphan payload byte can be interpreted as standalone input echo. */
+    unsigned earlier_input_updates = s_input_updates;
     s_epoch = 4;
     push_config(0, 10, 4, 1);
     drain_all();
     push_config(11, 24, 4, 2); /* byte 10 was dropped by a full queue */
     drain_all();
     assert(s_confirmed == 1 && s_ota_replies == 1);
+    assert(s_input_updates == earlier_input_updates);
+    assert(s_invalidations >= 2);
     push_config(0, 24, 4, 2);
     drain_all();
     assert(s_confirmed == 2 && s_ota_replies == 2);
@@ -270,7 +279,7 @@ int main(void) {
     drain_all();
     assert(s_confirmed == 2 && s_ota_replies == 2);
 
-    puts("PASS: real FSM+codec cable epochs (dropped events, partial RX, stale queue)");
+    puts("PASS: real FSM+codec cable epochs (dropped events, orphan bytes, stale queue)");
 }
 """
 
