@@ -107,12 +107,16 @@ typedef enum {
 } z906_effect_t;
 #include "z906_commands.h"
 typedef struct {
-    bool cable_connected, power, mute;
+    bool cable_connected, power, mute, auto_standby_enabled;
     uint8_t volume, volume_bass, volume_center, volume_rear;
+    uint8_t digital_signal_status;
+    z906_input_t input;
+    z906_effect_t effect;
 } z906_state_t;
 void z906_state_get(z906_state_t *);
 uint32_t z906_state_get_cable_epoch(void);
 bool z906_state_confirm_main_for_epoch(uint32_t);
+bool z906_state_apply_verified_config_for_epoch(uint32_t, const z906_state_t *);
 void z906_state_set_main_valid(bool);
 void z906_state_set_volume(uint8_t);
 void z906_state_set_trim(uint8_t, uint8_t);
@@ -175,6 +179,15 @@ void z906_state_set_main_valid(bool valid) {
 bool z906_state_confirm_main_for_epoch(uint32_t e) {
     if (!s_state.cable_connected || e != s_epoch) return false;
     ++s_confirmed;
+    return true;
+}
+bool z906_state_apply_verified_config_for_epoch(uint32_t e, const z906_state_t *cfg) {
+    if (!s_state.cable_connected || e != s_epoch || cfg == NULL) return false;
+    ++s_confirmed;
+    ++s_input_updates;
+    s_state.volume = cfg->volume;
+    s_state.input = cfg->input;
+    s_state.power = cfg->power;
     return true;
 }
 void z906_state_set_volume(uint8_t v) { s_state.volume = v; }
