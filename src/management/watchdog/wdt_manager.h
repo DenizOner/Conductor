@@ -30,6 +30,12 @@ bool wdt_manager_init(uint32_t timeout_seconds);
  */
 bool wdt_manager_register_task(void);
 
+/** @brief True only if the calling task is subscribed in the ESP-IDF TWDT. */
+bool wdt_manager_is_current_task_registered(void);
+
+/** @brief Resets TWDT for calling task and returns true only on ESP_OK. */
+bool wdt_manager_reset_checked(void);
+
 /**
  * @brief Resets (pets) the TWDT for the calling task.
  */

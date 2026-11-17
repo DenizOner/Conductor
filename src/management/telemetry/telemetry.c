@@ -285,24 +285,22 @@ static void prv_telemetry_task(void *pvParameters)
 {
     (void)pvParameters; /* No gate handle — startup handled by private semaphore */
 
-    wdt_manager_register_task();
+    bool twdt_registered = wdt_manager_register_task();
+    if (!twdt_registered) {
+        ESP_LOGE(TAG, "telemetry_task is NOT subscribed to TWDT; OTA health will fail");
+    }
     ESP_LOGI(TAG, "telemetry_task running (Priority %u)", TELEMETRY_TASK_PRIORITY);
 
     /* Signal telemetry_start() that this task is alive and entering its loop */
     xSemaphoreGive(s_started_sem);
 
-    bool twdt_reported = false;
-
     while (1) {
-        wdt_manager_reset();
+        bool twdt_fed = twdt_registered && wdt_manager_reset_checked();
         telemetry_process_cycle();
 
-        /* Report TWDT health to OTA engine once after a successful cycle.
-         * This proves all TWDT-registered tasks are alive and feeding. */
-        if (!twdt_reported) {
-            ota_health_report_twdt_ok();
-            twdt_reported = true;
-        }
+        /* This proves only that THIS task is registered and fed successfully.
+         * It does not claim other TWDT subscribers are healthy. */
+        ota_health_report_twdt_observation(twdt_fed);
 
         /* Single runtime owner of the pending-image health evaluation. */
         ota_client_process_cycle();

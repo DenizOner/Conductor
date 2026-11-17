@@ -39,6 +39,8 @@ static ota_health_time_fn_t s_time_fn_for_test = NULL;
 static ota_health_time_fn_t s_status_time_fn_for_test = NULL;
 static ota_health_bool_fn_t s_zigbee_ready_fn_for_test = NULL;
 static ota_health_bool_fn_t s_nvs_healthy_fn_for_test = NULL;
+static ota_health_bool_fn_t s_twdt_healthy_fn_for_test = NULL;
+static bool s_telemetry_twdt_feed_ok = false;
 static ota_health_bool_fn_t s_fallback_available_fn_for_test = NULL;
 
 static int64_t ota_health_now_us(void)
@@ -113,7 +115,14 @@ static void evaluate_criteria(void)
 {
     /* Current health evaluation — NOT latched (Model A: CURRENT HEALTH) */
     s_criteria.scheduler_healthy = (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING);
-    s_criteria.watchdog_healthy  = wdt_manager_is_initialized() && !wdt_manager_was_watchdog_reset();
+    /* The current owner must be subscribed and successfully fed this cycle.
+     * This is NOT an assertion about every other TWDT-subscribed task. */
+    s_criteria.watchdog_healthy = s_twdt_healthy_fn_for_test != NULL
+        ? s_twdt_healthy_fn_for_test()
+        : (wdt_manager_is_initialized() &&
+           !wdt_manager_was_watchdog_reset() &&
+           s_telemetry_twdt_feed_ok &&
+           wdt_manager_is_current_task_registered());
 
     /* 2. Read-only NVS probe: missing optional key != flash error. */
     s_criteria.nvs_healthy = s_nvs_healthy_fn_for_test != NULL
@@ -261,6 +270,11 @@ void ota_health_report_nvs_ok(void)
     ota_health_refresh_mask_from_criteria();
 }
 
+void ota_health_report_twdt_observation(bool fed)
+{
+    s_telemetry_twdt_feed_ok = fed;
+}
+
 void ota_health_report_twdt_ok(void)
 {
     s_criteria.watchdog_healthy = true;
@@ -313,6 +327,11 @@ void ota_health_set_zigbee_ready_fn_for_test(ota_health_bool_fn_t fn)
     s_zigbee_ready_fn_for_test = fn;
 }
 
+void ota_health_set_twdt_healthy_fn_for_test(ota_health_bool_fn_t fn)
+{
+    s_twdt_healthy_fn_for_test = fn;
+}
+
 void ota_health_set_nvs_healthy_fn_for_test(ota_health_bool_fn_t fn)
 {
     s_nvs_healthy_fn_for_test = fn;
@@ -345,6 +364,8 @@ void ota_health_reset_for_test(void)
     s_status_time_fn_for_test = NULL;
     s_zigbee_ready_fn_for_test = NULL;
     s_nvs_healthy_fn_for_test = NULL;
+    s_twdt_healthy_fn_for_test = NULL;
+    s_telemetry_twdt_feed_ok = false;
     s_fallback_available_fn_for_test = NULL;
     s_rollback_fn_for_test = NULL;
     s_mark_valid_fn_for_test = NULL;
