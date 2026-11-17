@@ -38,6 +38,7 @@ jobs:
           node tools/test_converter.js
           node tools/validate_command_parity.js
           python3 tools/test_ota_boot_health.py
+          python3 tools/test_z906_codec_host.py
 
   build-firmware:
     name: Build Firmware Binary & Validate OTA

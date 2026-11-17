@@ -18,6 +18,7 @@
 #include "z906_codec.h"
 /* Include protocol command and constants header */
 #include "z906_commands.h"
+#include <string.h>
 
 /**
  * @brief Set up test fixtures before each test execution.

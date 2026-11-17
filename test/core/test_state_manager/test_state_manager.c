@@ -72,6 +72,23 @@ void test_main_status_requires_current_cable_epoch(void)
     TEST_ASSERT_EQUAL_INT64(0, z906_state_get_main_status_time_us());
 }
 
+/** @brief OTA response evidence is distinct from a spontaneous CONFIG frame. */
+void test_matched_status_requires_live_query_and_cable(void)
+{
+    z906_state_set_cable_status(true);
+    z906_state_set_main_valid(true);
+    TEST_ASSERT_EQUAL_INT64(0, z906_state_get_matched_status_reply_time_us());
+
+    z906_state_note_matched_status_reply(esp_timer_get_time());
+    TEST_ASSERT_TRUE(z906_state_get_matched_status_reply_time_us() > 0);
+
+    z906_state_set_cable_status(false);
+    TEST_ASSERT_EQUAL_INT64(0, z906_state_get_matched_status_reply_time_us());
+
+    z906_state_set_cable_status(true);
+    TEST_ASSERT_EQUAL_INT64(0, z906_state_get_matched_status_reply_time_us());
+}
+
 void test_state_defaults(void)
 {
     /* State container struct */
@@ -532,6 +549,7 @@ int runUnityTests(void)
     RUN_TEST(test_state_defaults);
     RUN_TEST(test_main_status_timestamp_invalidated_on_cable_loss);
     RUN_TEST(test_main_status_requires_current_cable_epoch);
+    RUN_TEST(test_matched_status_requires_live_query_and_cable);
     RUN_TEST(test_state_volume_boundaries);
     RUN_TEST(test_state_input_transitions);
     RUN_TEST(test_state_telemetry_fields);
