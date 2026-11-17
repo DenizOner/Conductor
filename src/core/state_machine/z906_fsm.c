@@ -84,6 +84,13 @@ static void handle_amp_byte(uint8_t byte)
     if (parse_res == Z906_PARSE_RESULT_FRAME_COMPLETE) {
         switch (pkt.type) {
             case Z906_PACKET_CONFIG: {
+                z906_state_t cable_state;
+                z906_state_get(&cable_state);
+                if (!cable_state.cable_connected) {
+                    /* Preserve raw passthrough above; drop only stale state. */
+                    ESP_LOGW(TAG, "Discarding CONFIG state while DE-15 is disconnected");
+                    break;
+                }
                 ESP_LOGI(TAG, "Confirmed Amp Config: Vol=%d, Input=%d, Effect=%d, Mute=%d, Standby=%d",
                          pkt.data.config.volume, pkt.data.config.input, pkt.data.config.effect,
                          pkt.data.config.mute, pkt.data.config.standby);
@@ -258,6 +265,9 @@ void z906_fsm_step(TickType_t block_time)
             break;
 
         case EVENT_CABLE_STATUS_CHANGED:
+            /* A frame begun before a cable transition may not complete in the
+             * new physical connection epoch. Do not reuse partial bytes. */
+            z906_codec_init(&s_amp_codec_ctx);
             if (!event.data.cable_connected) {
                 fsm_set_state(FSM_STATE_FAULT);
             } else if (s_fsm_state == FSM_STATE_FAULT) {

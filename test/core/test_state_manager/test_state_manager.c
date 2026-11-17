@@ -53,6 +53,25 @@ void test_main_status_timestamp_invalidated_on_cable_loss(void)
     TEST_ASSERT_EQUAL_INT64(0, z906_state_get_main_status_time_us());
 }
 
+/** @brief A reconnect or queued validity call must never reuse the prior cable epoch. */
+void test_main_status_requires_current_cable_epoch(void)
+{
+    z906_state_set_main_valid(true);
+    TEST_ASSERT_FALSE(z906_state_is_main_valid());
+
+    z906_state_set_cable_status(true);
+    z906_state_set_main_valid(true);
+    TEST_ASSERT_TRUE(z906_state_is_main_valid());
+
+    z906_state_set_cable_status(false);
+    z906_state_set_main_valid(true); /* Simulated late queued CONFIG frame. */
+    TEST_ASSERT_FALSE(z906_state_is_main_valid());
+
+    z906_state_set_cable_status(true);
+    TEST_ASSERT_FALSE(z906_state_is_main_valid());
+    TEST_ASSERT_EQUAL_INT64(0, z906_state_get_main_status_time_us());
+}
+
 void test_state_defaults(void)
 {
     /* State container struct */
@@ -512,6 +531,7 @@ int runUnityTests(void)
     UNITY_BEGIN();
     RUN_TEST(test_state_defaults);
     RUN_TEST(test_main_status_timestamp_invalidated_on_cable_loss);
+    RUN_TEST(test_main_status_requires_current_cable_epoch);
     RUN_TEST(test_state_volume_boundaries);
     RUN_TEST(test_state_input_transitions);
     RUN_TEST(test_state_telemetry_fields);

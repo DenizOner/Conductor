@@ -383,8 +383,9 @@ void z906_state_set_cable_status(bool connected)
         s_current_state.is_operational  = connected;
         changed = true;
     }
-    if (!connected) {
-        /* Invalidate verified measurements on cable loss */
+    if (changed || !connected) {
+        /* Each physical cable epoch requires a new verified CONFIG frame.
+         * Reset both on disconnect and reconnect, never reuse old state. */
         s_current_state.main_state_valid = false;
         s_current_state.temp_valid       = false;
         s_last_main_status_time_us       = 0;
@@ -400,8 +401,10 @@ void z906_state_set_cable_status(bool connected)
 void z906_state_set_main_valid(bool valid)
 {
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    s_current_state.main_state_valid = valid;
-    s_last_main_status_time_us = valid ? esp_timer_get_time() : 0;
+    /* Queued amplifier bytes must not resurrect validity while unplugged. */
+    bool accepted = valid && s_current_state.cable_connected;
+    s_current_state.main_state_valid = accepted;
+    s_last_main_status_time_us = accepted ? esp_timer_get_time() : 0;
     xSemaphoreGive(s_state_mutex);
 
     /* Notify all hardware attributes — first verified frame is special */
