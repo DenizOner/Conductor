@@ -101,33 +101,28 @@ static void handle_amp_byte(uint8_t byte, int64_t received_at_us, uint32_t cable
     if (parse_res == Z906_PARSE_RESULT_FRAME_COMPLETE) {
         switch (pkt.type) {
             case Z906_PACKET_CONFIG: {
-                z906_state_t cable_state;
-                z906_state_get(&cable_state);
-                if (!cable_state.cable_connected ||
-                    z906_state_get_cable_epoch() != cable_epoch) {
-                    /* Preserve raw passthrough; discard stale physical state. */
+                /* The complete, LRC/semantics-checked CONFIG is committed
+                 * in one state-mutex transaction. A concurrent cable transition
+                 * rejects all fields, not merely the final validity bit. */
+                z906_state_t confirmed = { 0 };
+                confirmed.volume = pkt.data.config.volume;
+                confirmed.volume_bass = pkt.data.config.volume_bass;
+                confirmed.volume_center = pkt.data.config.volume_center;
+                confirmed.volume_rear = pkt.data.config.volume_rear;
+                confirmed.input = pkt.data.config.input;
+                confirmed.effect = pkt.data.config.effect;
+                confirmed.mute = pkt.data.config.mute;
+                confirmed.digital_signal_status = pkt.data.config.digital_signal_status;
+                confirmed.auto_standby_enabled = pkt.data.config.auto_standby_enabled;
+                /* The amplifier's Byte 17 defines true physical power. */
+                confirmed.power = !pkt.data.config.standby;
+                if (!z906_state_apply_verified_config_for_epoch(cable_epoch, &confirmed)) {
                     ESP_LOGW(TAG, "Discarding CONFIG from stale/unplugged cable epoch");
                     break;
                 }
                 ESP_LOGI(TAG, "Confirmed Amp Config: Vol=%d, Input=%d, Effect=%d, Mute=%d, Standby=%d",
                          pkt.data.config.volume, pkt.data.config.input, pkt.data.config.effect,
                          pkt.data.config.mute, pkt.data.config.standby);
-                z906_state_set_volume(pkt.data.config.volume);
-                z906_state_set_trim(0, pkt.data.config.volume_bass);
-                z906_state_set_trim(1, pkt.data.config.volume_center);
-                z906_state_set_trim(2, pkt.data.config.volume_rear);
-                z906_state_set_input(pkt.data.config.input);
-                z906_state_set_effect(pkt.data.config.effect);
-                z906_state_set_mute(pkt.data.config.mute);
-                z906_state_set_digital_signal_status(pkt.data.config.digital_signal_status);
-                z906_state_set_auto_standby(pkt.data.config.auto_standby_enabled);
-
-                /* Set confirmed physical power state directly from Byte 17 (0 = ON, 1 = Standby) */
-                z906_state_set_power(!pkt.data.config.standby);
-                if (!z906_state_confirm_main_for_epoch(cable_epoch)) {
-                    /* Cable changed during CONFIG state updates. No OTA proof. */
-                    break;
-                }
                 if (pkt.data.config.standby) {
                     fsm_set_state(FSM_STATE_STANDBY);
                 } else if (pkt.data.config.mute) {

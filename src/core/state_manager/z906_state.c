@@ -419,6 +419,50 @@ uint32_t z906_state_get_cable_epoch(void)
     return epoch;
 }
 
+bool z906_state_apply_verified_config_for_epoch(uint32_t epoch,
+                                                const z906_state_t *verified)
+{
+    if (s_state_mutex == NULL || verified == NULL ||
+        verified->volume > Z906_MAX_VOLUME_LEVEL ||
+        verified->volume_bass > Z906_MAX_VOLUME_LEVEL ||
+        verified->volume_center > Z906_MAX_VOLUME_LEVEL ||
+        verified->volume_rear > Z906_MAX_VOLUME_LEVEL ||
+        verified->input < Z906_INPUT_SIX_CHANNEL_DIRECT ||
+        verified->input > Z906_INPUT_AUXILIARY ||
+        verified->effect < Z906_EFFECT_3D ||
+        verified->effect > Z906_EFFECT_NONE) {
+        return false;
+    }
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool accepted = s_current_state.cable_connected && s_cable_epoch == epoch;
+    if (accepted) {
+        /* One commit: no reader or cable transition can observe a partial
+         * CONFIG field update or a validity flag for another cable epoch. */
+        s_current_state.volume = verified->volume;
+        s_current_state.volume_bass = verified->volume_bass;
+        s_current_state.volume_center = verified->volume_center;
+        s_current_state.volume_rear = verified->volume_rear;
+        s_current_state.input = verified->input;
+        s_current_state.effect = verified->effect;
+        s_current_state.mute = verified->mute;
+        s_current_state.digital_signal_status = verified->digital_signal_status;
+        s_current_state.auto_standby_enabled = verified->auto_standby_enabled;
+        s_current_state.power = verified->power;
+        s_current_state.main_state_valid = true;
+        s_last_main_status_time_us = esp_timer_get_time();
+    }
+    xSemaphoreGive(s_state_mutex);
+
+    if (accepted) {
+        /* Previously each field setter notified, followed by the full
+         * main-state notification. Keep the full refresh, but publish only
+         * the coherent confirmed snapshot after releasing the state mutex. */
+        prv_notify_observer((1UL << 17) - 1UL);
+    }
+    return accepted;
+}
+
 bool z906_state_confirm_main_for_epoch(uint32_t epoch)
 {
     if (s_state_mutex == NULL) {

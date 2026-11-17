@@ -191,6 +191,13 @@ uint32_t z906_state_get_cable_epoch(void);
  */
 bool z906_state_confirm_main_for_epoch(uint32_t expected_epoch);
 
+/** @brief Commits the complete, verified CONFIG state atomically only if the
+ *         physical cable epoch still matches. No partial attr updates/observer
+ *         notifications are emitted for stale queued frames.
+ */
+bool z906_state_apply_verified_config_for_epoch(uint32_t expected_epoch,
+                                                const z906_state_t *verified);
+
 /**
  * @brief Sets the validity of main control hardware state (power, volume, trims, etc.).
  * @param valid true once first complete status configuration frame is processed.
