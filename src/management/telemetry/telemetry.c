@@ -27,6 +27,8 @@ static telemetry_stat_t s_stats[TELEMETRY_QUERY_COUNT] = { 0 };
 /* Track active pending query and dispatch timestamp */
 static int s_pending_query_id = -1;
 static int64_t s_pending_dispatch_time_us = 0;
+/* No RX can match a query until UART has accepted its command byte. */
+static bool s_pending_tx_committed = false;
 /* Protects query lifecycle shared by telemetry_task, CLI and z906_fsm_task. */
 static portMUX_TYPE s_query_mux = portMUX_INITIALIZER_UNLOCKED;
 #define TELEMETRY_TIMEOUT_US (2000000) /* 2.0 seconds timeout for amplifier response */
@@ -55,13 +57,14 @@ bool telemetry_dispatch_query(uint8_t query_opcode)
     }
 
     telemetry_query_id_t qid = opcode_to_query_id(query_opcode);
-    int64_t now = esp_timer_get_time();
     portENTER_CRITICAL(&s_query_mux);
     bool available = (s_pending_query_id < 0);
     if (available) {
-        /* Arm before TX: the FSM may decode a fast reply immediately. */
+        /* Reserve the TX slot, but RX matching stays OFF until a successful
+         * uart_write_bytes return. FSM preemption cannot pre-approve TX. */
         s_pending_query_id = (int)qid;
-        s_pending_dispatch_time_us = now;
+        s_pending_tx_committed = false;
+        s_pending_dispatch_time_us = 0;
     }
     portEXIT_CRITICAL(&s_query_mux);
     if (!available) {
@@ -70,21 +73,26 @@ bool telemetry_dispatch_query(uint8_t query_opcode)
     }
 
     int written = z906_uart_hal_write_amp(&query_opcode, 1);
-    z906_cmd_verifier_unlock();
+    int64_t committed_us = esp_timer_get_time();
 
     portENTER_CRITICAL(&s_query_mux);
-    if (written == 1) {
+    if (written == 1 && s_pending_query_id == (int)qid) {
+        s_pending_dispatch_time_us = committed_us;
+        s_pending_tx_committed = true;
         s_stats[qid].request_count++;
-        s_stats[qid].last_request_time_us = now;
-    } else if (s_pending_query_id == (int)qid &&
-               s_pending_dispatch_time_us == now) {
+        s_stats[qid].last_request_time_us = committed_us;
+    } else if (s_pending_query_id == (int)qid) {
         s_pending_query_id = -1;
+        s_pending_tx_committed = false;
+        s_pending_dispatch_time_us = 0;
     }
     portEXIT_CRITICAL(&s_query_mux);
+    z906_cmd_verifier_unlock();
     return written == 1;
 }
 
-void telemetry_notify_response_received(telemetry_query_id_t query_id)
+void telemetry_notify_response_received(telemetry_query_id_t query_id,
+                                       int64_t frame_started_at_us)
 {
     if ((int)query_id < 0 || query_id >= TELEMETRY_QUERY_COUNT) {
         return;
@@ -96,12 +104,16 @@ void telemetry_notify_response_received(telemetry_query_id_t query_id)
     /* Unsolicited CONFIG still updates physical state via FSM, but is not
      * proof that our OTA STATUS query received a timely matching reply. */
     if (s_pending_query_id == (int)query_id &&
+        s_pending_tx_committed &&
+        frame_started_at_us >= s_pending_dispatch_time_us &&
+        frame_started_at_us <= now &&
         now >= s_pending_dispatch_time_us &&
         (now - s_pending_dispatch_time_us) <= TELEMETRY_TIMEOUT_US) {
         s_stats[query_id].success_count++;
         s_stats[query_id].consecutive_failures = 0;
         s_stats[query_id].last_success_time_us = now;
         s_pending_query_id = -1;
+        s_pending_tx_committed = false;
         matched_status = (query_id == TELEMETRY_QUERY_STATUS);
     }
     portEXIT_CRITICAL(&s_query_mux);
@@ -133,6 +145,7 @@ void telemetry_process_cycle(void)
         z906_state_set_cable_status(cable_now);
         portENTER_CRITICAL(&s_query_mux);
         s_pending_query_id = -1;
+        s_pending_tx_committed = false;
         s_pending_dispatch_time_us = 0;
         portEXIT_CRITICAL(&s_query_mux);
         s_last_ota_status_request_us = 0;
@@ -147,6 +160,7 @@ void telemetry_process_cycle(void)
     if (!cable_now) {
         portENTER_CRITICAL(&s_query_mux);
         s_pending_query_id = -1;
+        s_pending_tx_committed = false;
         portEXIT_CRITICAL(&s_query_mux);
         return;
     }
@@ -156,12 +170,13 @@ void telemetry_process_cycle(void)
     telemetry_query_id_t timed_out_id = TELEMETRY_QUERY_COUNT;
     uint32_t consecutive_failures = 0;
     portENTER_CRITICAL(&s_query_mux);
-    if (s_pending_query_id >= 0 &&
+    if (s_pending_query_id >= 0 && s_pending_tx_committed &&
         (now - s_pending_dispatch_time_us) > TELEMETRY_TIMEOUT_US) {
         timed_out_id = (telemetry_query_id_t)s_pending_query_id;
         s_stats[timed_out_id].timeout_count++;
         consecutive_failures = ++s_stats[timed_out_id].consecutive_failures;
         s_pending_query_id = -1;
+        s_pending_tx_committed = false;
     }
     bool query_available = (s_pending_query_id < 0);
     portEXIT_CRITICAL(&s_query_mux);

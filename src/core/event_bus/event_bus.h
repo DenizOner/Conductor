@@ -38,6 +38,8 @@ typedef struct {
         uint8_t raw_byte;
         bool cable_connected;
     } data;
+    /* Amplifier RX monotonic first-byte time; zero for other event types. */
+    int64_t received_at_us;
 } z906_event_t;
 
 /**

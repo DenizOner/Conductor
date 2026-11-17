@@ -26,6 +26,8 @@ static const char *TAG = "Z906_FSM";
 
 static z906_fsm_state_t s_fsm_state = FSM_STATE_UNINITIALIZED;
 static z906_codec_ctx_t s_amp_codec_ctx;
+/* First byte time, captured at UART ingress, not the later FSM queue drain. */
+static int64_t s_amp_frame_started_us = 0;
 
 static void fsm_set_state(z906_fsm_state_t new_state)
 {
@@ -43,6 +45,7 @@ static void fsm_set_state(z906_fsm_state_t new_state)
 bool z906_fsm_init(void)
 {
     z906_codec_init(&s_amp_codec_ctx);
+    s_amp_frame_started_us = 0;
     fsm_set_state(FSM_STATE_BOOTING);
     return true;
 }
@@ -72,14 +75,21 @@ static void handle_console_byte(uint8_t byte)
     z906_uart_hal_write_amp(&byte, 1);
 }
 
-static void handle_amp_byte(uint8_t byte)
+static void handle_amp_byte(uint8_t byte, int64_t received_at_us)
 {
     /* 1. Forward raw byte to physical console */
     z906_uart_hal_write_console(&byte, 1);
 
-    /* 2. Process stream classifier with strict multi-byte vs single-byte isolation */
+    /* 2. A queued old frame cannot be given the time it was processed.
+     * Anchor complete CONFIG/telemetry replies to their first byte at RX. */
+    if (!z906_codec_is_frame_in_progress(&s_amp_codec_ctx) && byte == 0xAA) {
+        s_amp_frame_started_us = received_at_us;
+    }
     z906_decoded_packet_t pkt;
     z906_parse_result_t parse_res = z906_codec_feed_byte(&s_amp_codec_ctx, byte, &pkt);
+    if (parse_res == Z906_PARSE_RESULT_RESYNC_DROP) {
+        s_amp_frame_started_us = 0;
+    }
 
     if (parse_res == Z906_PARSE_RESULT_FRAME_COMPLETE) {
         switch (pkt.type) {
@@ -114,7 +124,7 @@ static void handle_amp_byte(uint8_t byte)
                 } else {
                     fsm_set_state(FSM_STATE_ACTIVE);
                 }
-                telemetry_notify_response_received(TELEMETRY_QUERY_STATUS);
+                telemetry_notify_response_received(TELEMETRY_QUERY_STATUS, s_amp_frame_started_us);
                 break;
             }
 
@@ -126,19 +136,19 @@ static void handle_amp_byte(uint8_t byte)
                 ESP_LOGI(TAG, "Confirmed Amp Temperatures: [%d, %d, %d] \xc2\xb0""C",
                          pkt.data.temp.temp_celsius[0], pkt.data.temp.temp_celsius[1], pkt.data.temp.temp_celsius[2]);
                 z906_state_set_temperature(pkt.data.temp.temp_celsius);
-                telemetry_notify_response_received(TELEMETRY_QUERY_TEMP);
+                telemetry_notify_response_received(TELEMETRY_QUERY_TEMP, s_amp_frame_started_us);
                 break;
 
             case Z906_PACKET_IDLE:
                 ESP_LOGD(TAG, "Confirmed Amp Idle Duration: %lu s", (unsigned long)pkt.data.idle.idle_seconds);
                 z906_state_set_idle_seconds(pkt.data.idle.idle_seconds);
-                telemetry_notify_response_received(TELEMETRY_QUERY_IDLE);
+                telemetry_notify_response_received(TELEMETRY_QUERY_IDLE, s_amp_frame_started_us);
                 break;
 
             case Z906_PACKET_INPUT_VOL:
                 ESP_LOGD(TAG, "Confirmed Amp Input Signal Level: %lu", (unsigned long)pkt.data.input_vol.input_volume);
                 z906_state_set_input_signal_level(pkt.data.input_vol.input_volume);
-                telemetry_notify_response_received(TELEMETRY_QUERY_INPUT_VOL);
+                telemetry_notify_response_received(TELEMETRY_QUERY_INPUT_VOL, s_amp_frame_started_us);
                 break;
 
             default:
@@ -261,13 +271,14 @@ void z906_fsm_step(TickType_t block_time)
             break;
 
         case EVENT_AMP_RX_BYTE:
-            handle_amp_byte(event.data.raw_byte);
+            handle_amp_byte(event.data.raw_byte, event.received_at_us);
             break;
 
         case EVENT_CABLE_STATUS_CHANGED:
             /* A frame begun before a cable transition may not complete in the
              * new physical connection epoch. Do not reuse partial bytes. */
             z906_codec_init(&s_amp_codec_ctx);
+            s_amp_frame_started_us = 0;
             if (!event.data.cable_connected) {
                 fsm_set_state(FSM_STATE_FAULT);
             } else if (s_fsm_state == FSM_STATE_FAULT) {

@@ -56,13 +56,16 @@ bool telemetry_dispatch_query(uint8_t query_opcode);
 
 /**
  * @brief Notifies the telemetry manager that a valid response was received and decoded from UART.
- * Only matches the outstanding query id inside the 2-second response window;
- * unsolicited or timed-out frames do not count as successful queries.
+ * Only matches the outstanding query id AFTER a successful UART send, inside
+ * the 2-second response window. The received frame must START at or after
+ * transmit commit; pre-TX and already-queued frames cannot credit a query.
  * A matched STATUS response is recorded in the confirmed state manager for OTA.
  *
  * @param query_id Query identifier.
+ * @param frame_started_at_us Monotonic ingress time of the packet's first byte.
  */
-void telemetry_notify_response_received(telemetry_query_id_t query_id);
+void telemetry_notify_response_received(telemetry_query_id_t query_id,
+                                       int64_t frame_started_at_us);
 
 /**
  * @brief Retrieves statistical tracking information for a telemetry query.

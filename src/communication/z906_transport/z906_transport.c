@@ -32,6 +32,7 @@
 #include "freertos/semphr.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
 
 static const char *TAG = "Z906_TRANSPORT";
 
@@ -108,7 +109,8 @@ static void prv_uart_rx_task(void *pvParameters)
         if (z906_uart_hal_read_amp(&rx_byte, 1, pdMS_TO_TICKS(5)) > 0) {
             z906_event_t evt = {
                 .type = EVENT_AMP_RX_BYTE,
-                .data = { .raw_byte = rx_byte }
+                .data = { .raw_byte = rx_byte },
+                .received_at_us = esp_timer_get_time()
             };
             event_bus_post(&evt, 0);
         }
