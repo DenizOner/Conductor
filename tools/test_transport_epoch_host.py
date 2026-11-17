@@ -10,6 +10,11 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[1]
 
 HEADERS = {
+    "esp_timer.h": """
+#pragma once
+#include <stdint.h>
+int64_t esp_timer_get_time(void);
+""",
     "esp_err.h": """
 #pragma once
 typedef int esp_err_t;
@@ -94,6 +99,7 @@ static unsigned s_cycles, s_flushes, s_rx_reads, s_posts;
 static z906_event_t s_recorded[4];
 static bool s_registered;
 
+int64_t esp_timer_get_time(void) { return 1000000LL + (int64_t)s_cycles * 1000000LL; }
 uint32_t z906_state_get_cable_epoch(void) { return s_epoch; }
 bool wdt_manager_register_task(void) { s_registered = true; return true; }
 void wdt_manager_reset(void) { assert(s_registered); }
