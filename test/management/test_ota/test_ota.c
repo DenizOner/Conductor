@@ -407,6 +407,9 @@ void test_ota_without_fallback_stays_pending(void)
     TEST_ASSERT_TRUE(ota_health_is_pending_verify());
     TEST_ASSERT_EQUAL(OTA_HEALTH_RECOVERY_NO_FALLBACK,
                       ota_health_get_recovery_state());
+    ota_client_process_cycle();
+    TEST_ASSERT_EQUAL(OTA_STATE_FAILED, ota_client_get_state());
+    TEST_ASSERT_EQUAL(OTA_RESULT_HEALTH_CHECK_FAILED, ota_client_get_last_result());
 }
 
 /** @brief An authenticated CONFIG frame during the window permits validation. */
