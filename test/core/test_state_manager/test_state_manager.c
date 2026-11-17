@@ -117,6 +117,55 @@ void test_cable_epoch_confirm_requires_current_connection(void)
     TEST_ASSERT_TRUE(z906_state_confirm_main_for_epoch(epoch_three));
 }
 
+/** @brief Atomic CONFIG update must reject stale epochs without touching fields. */
+void test_config_atomic_commit_rejects_old_epoch_without_state_changes(void)
+{
+    z906_state_set_cable_status(true);
+    uint32_t old_epoch = z906_state_get_cable_epoch();
+    z906_state_set_cable_status(false);
+    z906_state_set_cable_status(true);
+    uint32_t current_epoch = z906_state_get_cable_epoch();
+
+    z906_state_t before;
+    z906_state_get(&before);
+    z906_state_t proposed = { 0 };
+    proposed.power = true;
+    proposed.volume = 31;
+    proposed.volume_bass = 21;
+    proposed.volume_center = 20;
+    proposed.volume_rear = 19;
+    proposed.input = Z906_INPUT_OPTICAL_1;
+    proposed.effect = Z906_EFFECT_3D;
+    proposed.mute = true;
+    proposed.digital_signal_status = 0x17;
+    proposed.auto_standby_enabled = true;
+
+    TEST_ASSERT_FALSE(z906_state_apply_verified_config_for_epoch(old_epoch, &proposed));
+    z906_state_t after;
+    z906_state_get(&after);
+    TEST_ASSERT_EQUAL_UINT8(before.volume, after.volume);
+    TEST_ASSERT_EQUAL(before.input, after.input);
+    TEST_ASSERT_EQUAL(before.power, after.power);
+    TEST_ASSERT_FALSE(z906_state_is_main_valid());
+
+    proposed.volume = 44; /* Wrong physical bounds must be rejected. */
+    TEST_ASSERT_FALSE(z906_state_apply_verified_config_for_epoch(current_epoch, &proposed));
+    proposed.volume = 31;
+    TEST_ASSERT_TRUE(z906_state_apply_verified_config_for_epoch(current_epoch, &proposed));
+    z906_state_get(&after);
+    TEST_ASSERT_TRUE(z906_state_is_main_valid());
+    TEST_ASSERT_EQUAL_UINT8(31, after.volume);
+    TEST_ASSERT_EQUAL_UINT8(21, after.volume_bass);
+    TEST_ASSERT_EQUAL_UINT8(20, after.volume_center);
+    TEST_ASSERT_EQUAL_UINT8(19, after.volume_rear);
+    TEST_ASSERT_EQUAL(Z906_INPUT_OPTICAL_1, after.input);
+    TEST_ASSERT_EQUAL(Z906_EFFECT_3D, after.effect);
+    TEST_ASSERT_TRUE(after.power);
+    TEST_ASSERT_TRUE(after.mute);
+    TEST_ASSERT_TRUE(after.auto_standby_enabled);
+    TEST_ASSERT_EQUAL_HEX8(0x17, after.digital_signal_status);
+}
+
 void test_state_defaults(void)
 {
     /* State container struct */
@@ -578,6 +627,7 @@ int runUnityTests(void)
     RUN_TEST(test_main_status_timestamp_invalidated_on_cable_loss);
     RUN_TEST(test_main_status_requires_current_cable_epoch);
     RUN_TEST(test_cable_epoch_confirm_requires_current_connection);
+    RUN_TEST(test_config_atomic_commit_rejects_old_epoch_without_state_changes);
     RUN_TEST(test_matched_status_requires_live_query_and_cable);
     RUN_TEST(test_state_volume_boundaries);
     RUN_TEST(test_state_input_transitions);
