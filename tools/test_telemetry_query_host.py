@@ -135,6 +135,8 @@ TEST = r"""
 static int64_t s_now = 1000000;
 static bool s_busy, s_connected = true, s_ota_pending;
 static int s_writes, s_matched, s_disconnects;
+static bool s_inject_rx_during_write;
+static int s_write_result = 1;
 static uint8_t s_last_opcode;
 int64_t esp_timer_get_time(void) { return s_now; }
 bool z906_adc_hal_is_cable_connected(void) { return s_connected; }
@@ -145,7 +147,11 @@ int z906_uart_hal_write_amp(const uint8_t *b, size_t n) {
     assert(n == 1);
     s_last_opcode = *b;
     ++s_writes;
-    return 1;
+    /* A pre-commit RX callback must never be mistaken for a sent command. */
+    if (s_inject_rx_during_write) {
+        telemetry_notify_response_received(TELEMETRY_QUERY_STATUS, s_now);
+    }
+    return s_write_result;
 }
 void z906_state_note_matched_status_reply(int64_t stamp) {
     assert(stamp == s_now); ++s_matched;
@@ -163,7 +169,7 @@ int main(void) {
     telemetry_stat_t st;
     /* Prime the physical cable state, then test an unsolicited STATUS packet. */
     telemetry_process_cycle();
-    telemetry_notify_response_received(TELEMETRY_QUERY_STATUS);
+    telemetry_notify_response_received(TELEMETRY_QUERY_STATUS, s_now);
     assert(s_matched == 0);
     assert(telemetry_get_stats(TELEMETRY_QUERY_STATUS, &st));
     assert(st.success_count == 0);
@@ -173,13 +179,26 @@ int main(void) {
     assert(!telemetry_dispatch_query(0x34));
     assert(s_writes == 0);
     s_busy = false;
+    /* TX failure, including a decoder preemption during write, is not success. */
+    s_inject_rx_during_write = true;
+    s_write_result = 0;
+    assert(!telemetry_dispatch_query(0x34));
+    assert(s_matched == 0);
+    assert(telemetry_get_stats(TELEMETRY_QUERY_STATUS, &st));
+    assert(st.success_count == 0 && st.request_count == 0);
+    s_write_result = 1;
     assert(telemetry_dispatch_query(0x34));
-    assert(s_last_opcode == 0x34 && s_writes == 1);
+    assert(s_matched == 0); /* Pre-commit injection ignored even if TX succeeds. */
+    s_inject_rx_during_write = false;
+    assert(s_last_opcode == 0x34 && s_writes == 2);
     assert(!telemetry_dispatch_query(0x34)); /* No overlapping queries */
-    telemetry_notify_response_received(TELEMETRY_QUERY_TEMP);
+    telemetry_notify_response_received(TELEMETRY_QUERY_TEMP, s_now);
+    assert(s_matched == 0);
+    /* An old queued frame that began BEFORE TX must be rejected. */
+    telemetry_notify_response_received(TELEMETRY_QUERY_STATUS, s_now - 1);
     assert(s_matched == 0);
     s_now += 1000000;
-    telemetry_notify_response_received(TELEMETRY_QUERY_STATUS);
+    telemetry_notify_response_received(TELEMETRY_QUERY_STATUS, s_now);
     assert(s_matched == 1);
     assert(telemetry_get_stats(TELEMETRY_QUERY_STATUS, &st));
     assert(st.success_count == 1);
@@ -187,7 +206,7 @@ int main(void) {
     /* Valid CONFIG after the 2-second query timeout is NOT OTA evidence. */
     assert(telemetry_dispatch_query(0x34));
     s_now += 3000000;
-    telemetry_notify_response_received(TELEMETRY_QUERY_STATUS);
+    telemetry_notify_response_received(TELEMETRY_QUERY_STATUS, s_now);
     assert(s_matched == 1);
     telemetry_process_cycle();
     assert(telemetry_get_stats(TELEMETRY_QUERY_STATUS, &st));
@@ -207,12 +226,12 @@ int main(void) {
     assert(s_last_opcode == 0x34);
     int prev = s_writes;
     s_now += 1000000;
-    telemetry_notify_response_received(TELEMETRY_QUERY_STATUS);
+    telemetry_notify_response_received(TELEMETRY_QUERY_STATUS, s_now);
     s_now += 4000000;
     telemetry_process_cycle();
     assert(s_writes == prev + 1);
 
-    puts("PASS: real telemetry query lifecycle host cases");
+    puts("PASS: real telemetry query lifecycle host cases (pre-TX, failed TX, stale RX, timeout, cable)");
 }
 """
 
