@@ -30,6 +30,8 @@ static z906_codec_ctx_t s_amp_codec_ctx;
 static int64_t s_amp_frame_started_us = 0;
 static uint32_t s_fsm_cable_epoch = 0;
 static uint32_t s_fsm_rx_stream_epoch = 0;
+/* After RX stream loss, ignore payload-looking standalone opcodes until AA. */
+static bool s_amp_resync_required = false;
 
 static void fsm_set_state(z906_fsm_state_t new_state)
 {
@@ -50,6 +52,7 @@ bool z906_fsm_init(void)
     s_amp_frame_started_us = 0;
     s_fsm_cable_epoch = z906_state_get_cable_epoch();
     s_fsm_rx_stream_epoch = 0;
+    s_amp_resync_required = false;
     fsm_set_state(FSM_STATE_BOOTING);
     return true;
 }
@@ -273,6 +276,7 @@ static void fsm_sync_cable_epoch(void)
         /* Direct state generation, never a lossy EventBus cable notification. */
         z906_codec_init(&s_amp_codec_ctx);
         s_amp_frame_started_us = 0;
+        s_amp_resync_required = true;
         s_fsm_cable_epoch = current;
     }
 }
@@ -301,7 +305,20 @@ void z906_fsm_step(TickType_t block_time)
                 /* The UART-to-EventBus bridge dropped a byte or flushed RX. */
                 z906_codec_init(&s_amp_codec_ctx);
                 s_amp_frame_started_us = 0;
+                s_amp_resync_required = true;
                 s_fsm_rx_stream_epoch = event.rx_stream_epoch;
+                /* A missing byte makes previously confirmed RX continuity
+                 * untrustworthy even when the cable has not moved. */
+                z906_state_set_main_valid(false);
+            }
+            if (s_amp_resync_required && event.data.raw_byte != 0xAA) {
+                /* Preserve raw amplifier-to-console passthrough but never
+                 * interpret an orphaned frame payload as a standalone echo. */
+                z906_uart_hal_write_console(&event.data.raw_byte, 1);
+                break;
+            }
+            if (s_amp_resync_required) {
+                s_amp_resync_required = false;
             }
             handle_amp_byte(event.data.raw_byte, event.received_at_us,
                             event.cable_epoch);
