@@ -50,10 +50,10 @@ void nvs_close(nvs_handle_t);
 """,
     "esp_log.h": """
 #pragma once
-#define ESP_LOGE(...) ((void)0)
-#define ESP_LOGW(...) ((void)0)
-#define ESP_LOGI(...) ((void)0)
-#define ESP_LOGD(...) ((void)0)
+#define ESP_LOGE(tag, ...) ((void)(tag))
+#define ESP_LOGW(tag, ...) ((void)(tag))
+#define ESP_LOGI(tag, ...) ((void)(tag))
+#define ESP_LOGD(tag, ...) ((void)(tag))
 """
 }
 TEST = r"""
