@@ -89,6 +89,34 @@ void test_matched_status_requires_live_query_and_cable(void)
     TEST_ASSERT_EQUAL_INT64(0, z906_state_get_matched_status_reply_time_us());
 }
 
+/** @brief No delayed CONFIG may revive an older ADC cable epoch. */
+void test_cable_epoch_confirm_requires_current_connection(void)
+{
+    uint32_t boot_epoch = z906_state_get_cable_epoch();
+    TEST_ASSERT_FALSE(z906_state_confirm_main_for_epoch(boot_epoch));
+
+    z906_state_set_cable_status(true);
+    uint32_t epoch_one = z906_state_get_cable_epoch();
+    TEST_ASSERT_EQUAL_UINT32(boot_epoch + 1u, epoch_one);
+    TEST_ASSERT_FALSE(z906_state_confirm_main_for_epoch(boot_epoch));
+    TEST_ASSERT_TRUE(z906_state_confirm_main_for_epoch(epoch_one));
+    TEST_ASSERT_TRUE(z906_state_is_main_valid());
+
+    z906_state_set_cable_status(false);
+    uint32_t epoch_two = z906_state_get_cable_epoch();
+    TEST_ASSERT_EQUAL_UINT32(epoch_one + 1u, epoch_two);
+    TEST_ASSERT_FALSE(z906_state_confirm_main_for_epoch(epoch_one));
+    TEST_ASSERT_FALSE(z906_state_is_main_valid());
+
+    z906_state_set_cable_status(true);
+    uint32_t epoch_three = z906_state_get_cable_epoch();
+    TEST_ASSERT_EQUAL_UINT32(epoch_two + 1u, epoch_three);
+    TEST_ASSERT_FALSE(z906_state_confirm_main_for_epoch(epoch_one));
+    TEST_ASSERT_EQUAL_INT64(0, z906_state_get_matched_status_reply_time_us());
+    TEST_ASSERT_FALSE(z906_state_is_main_valid());
+    TEST_ASSERT_TRUE(z906_state_confirm_main_for_epoch(epoch_three));
+}
+
 void test_state_defaults(void)
 {
     /* State container struct */
@@ -549,6 +577,7 @@ int runUnityTests(void)
     RUN_TEST(test_state_defaults);
     RUN_TEST(test_main_status_timestamp_invalidated_on_cable_loss);
     RUN_TEST(test_main_status_requires_current_cable_epoch);
+    RUN_TEST(test_cable_epoch_confirm_requires_current_connection);
     RUN_TEST(test_matched_status_requires_live_query_and_cable);
     RUN_TEST(test_state_volume_boundaries);
     RUN_TEST(test_state_input_transitions);
