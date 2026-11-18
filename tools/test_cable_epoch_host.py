@@ -349,7 +349,10 @@ int main(void) {
     push_amp(0x03, old_epoch, old_stream); /* stale input */
     drain_all();
     assert(!s_state.mute && s_input_updates == previous_input_updates);
-    /* Confirm that a genuinely current single-byte echo remains functional. */
+    /* A cable generation gap requires a fresh full CONFIG frame before any
+     * orphan-looking standalone byte can be trusted again. */
+    push_config(0, 24, s_epoch, s_stream);
+    drain_all();
     push_amp(0x20, s_epoch, s_stream);
     drain_all();
     assert(s_state.mute);
