@@ -18,6 +18,7 @@
  */
 
 #include "z906_state.h"
+#include "z906_commands.h"
 #include "config.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -460,6 +461,112 @@ uint32_t z906_state_get_cable_epoch(void)
     uint32_t epoch = s_cable_epoch;
     xSemaphoreGive(s_state_mutex);
     return epoch;
+}
+
+/**
+ * @brief Applies one amplifier echo atomically against the cable and RX
+ *        continuity generations. No new mutex: the existing state lock
+ *        prevents a cable transition or loss event between check and write.
+ */
+bool z906_state_apply_amp_echo_for_generations(uint32_t cable_epoch,
+                                               uint32_t rx_stream_epoch,
+                                               uint8_t opcode)
+{
+    if (s_state_mutex == NULL) {
+        return false;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (!s_current_state.cable_connected || s_cable_epoch != cable_epoch ||
+        s_amp_rx_stream_epoch != rx_stream_epoch) {
+        xSemaphoreGive(s_state_mutex);
+        return false;
+    }
+
+    z906_state_t next = s_current_state;
+    uint32_t changed_bit = 0;
+    switch (opcode) {
+        case Z906_CMD_STANDBY_SAVE:
+            next.power = false; changed_bit = 1UL << 0; break;
+        case Z906_CMD_AMP_MUTED:
+            next.mute = true; changed_bit = 1UL << 5; break;
+        case Z906_CMD_AMP_UNMUTED:
+            next.mute = false; changed_bit = 1UL << 5; break;
+        case Z906_CMD_VOLUME_UP:
+            if (next.volume < Z906_MAX_VOLUME_LEVEL) ++next.volume;
+            changed_bit = 1UL << 1; break;
+        case Z906_CMD_VOLUME_DOWN:
+            if (next.volume > 0) --next.volume;
+            changed_bit = 1UL << 1; break;
+        case Z906_CMD_VOLUME_BASS_UP:
+            if (next.volume_bass < Z906_MAX_VOLUME_LEVEL) ++next.volume_bass;
+            changed_bit = 1UL << 2; break;
+        case Z906_CMD_VOLUME_BASS_DOWN:
+            if (next.volume_bass > 0) --next.volume_bass;
+            changed_bit = 1UL << 2; break;
+        case Z906_CMD_VOLUME_CENTER_UP:
+            if (next.volume_center < Z906_MAX_VOLUME_LEVEL) ++next.volume_center;
+            changed_bit = 1UL << 3; break;
+        case Z906_CMD_VOLUME_CENTER_DOWN:
+            if (next.volume_center > 0) --next.volume_center;
+            changed_bit = 1UL << 3; break;
+        case Z906_CMD_VOLUME_REAR_UP:
+            if (next.volume_rear < Z906_MAX_VOLUME_LEVEL) ++next.volume_rear;
+            changed_bit = 1UL << 4; break;
+        case Z906_CMD_VOLUME_REAR_DOWN:
+            if (next.volume_rear > 0) --next.volume_rear;
+            changed_bit = 1UL << 4; break;
+        case Z906_CMD_SELECT_INPUT_1:
+            next.input = Z906_INPUT_SIX_CHANNEL_DIRECT; changed_bit = 1UL << 6; break;
+        case Z906_CMD_SELECT_INPUT_2:
+            next.input = Z906_INPUT_RCA_STEREO; changed_bit = 1UL << 6; break;
+        case Z906_CMD_SELECT_INPUT_3:
+            next.input = Z906_INPUT_OPTICAL_1; changed_bit = 1UL << 6; break;
+        case Z906_CMD_SELECT_INPUT_4:
+            next.input = Z906_INPUT_OPTICAL_2; changed_bit = 1UL << 6; break;
+        case Z906_CMD_SELECT_INPUT_5:
+            next.input = Z906_INPUT_DIGITAL_COAXIAL; changed_bit = 1UL << 6; break;
+        case Z906_CMD_SELECT_INPUT_6:
+            next.input = Z906_INPUT_AUXILIARY; changed_bit = 1UL << 6; break;
+        case Z906_CMD_SELECT_EFFECT_3D:
+            next.effect = Z906_EFFECT_3D; changed_bit = 1UL << 7; break;
+        case Z906_CMD_SELECT_EFFECT_2_1:
+            next.effect = Z906_EFFECT_2_1; changed_bit = 1UL << 7; break;
+        case Z906_CMD_SELECT_EFFECT_4_1:
+            next.effect = Z906_EFFECT_4_1; changed_bit = 1UL << 7; break;
+        case Z906_CMD_SELECT_EFFECT_NONE:
+            next.effect = Z906_EFFECT_NONE; changed_bit = 1UL << 7; break;
+        default:
+            if (opcode >= Z906_DECODE_5_1 && opcode <= Z906_DECODE_UNKNOWN) {
+                next.digital_signal_status = opcode;
+                changed_bit = 1UL << 10;
+            }
+            break;
+    }
+
+    bool recognized = changed_bit != 0;
+    bool changed = false;
+    switch (changed_bit) {
+        case 1UL << 0: changed = next.power != s_current_state.power; break;
+        case 1UL << 1: changed = next.volume != s_current_state.volume; break;
+        case 1UL << 2: changed = next.volume_bass != s_current_state.volume_bass; break;
+        case 1UL << 3: changed = next.volume_center != s_current_state.volume_center; break;
+        case 1UL << 4: changed = next.volume_rear != s_current_state.volume_rear; break;
+        case 1UL << 5: changed = next.mute != s_current_state.mute; break;
+        case 1UL << 6: changed = next.input != s_current_state.input; break;
+        case 1UL << 7: changed = next.effect != s_current_state.effect; break;
+        case 1UL << 10:
+            changed = next.digital_signal_status != s_current_state.digital_signal_status;
+            break;
+        default: break;
+    }
+    if (changed) {
+        s_current_state = next;
+    }
+    xSemaphoreGive(s_state_mutex);
+    if (changed) {
+        prv_notify_observer(changed_bit);
+    }
+    return recognized;
 }
 
 bool z906_state_apply_verified_config_for_epoch(uint32_t epoch,

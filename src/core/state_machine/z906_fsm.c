@@ -171,95 +171,30 @@ static void handle_amp_byte(uint8_t byte, int64_t received_at_us,
         return;
     }
 
-    /* 3. Process standalone single-byte telemetry confirmations & physical button echoes per protocol.rst */
+    /* 3. Both epoch validation and any standalone echo state change occur
+     * under ONE state mutex transaction, after physical raw passthrough. */
+    if (!z906_state_apply_amp_echo_for_generations(cable_epoch, rx_stream_epoch,
+                                                   byte)) {
+        return;
+    }
     switch ((z906_cmd_header_t)byte) {
         case Z906_CMD_STANDBY_SAVE: /* 0x36: Saves settings & transitions to standby */
-            z906_state_set_power(false);
             fsm_set_state(FSM_STATE_STANDBY);
             break;
 
         case Z906_CMD_AMP_MUTED: /* 0x20: Amplifier reports muted status */
-            z906_state_set_mute(true);
             fsm_set_state(FSM_STATE_MUTED);
             break;
 
         case Z906_CMD_AMP_UNMUTED: /* 0x21: Amplifier reports unmuted status */
-            z906_state_set_mute(false);
             fsm_set_state(FSM_STATE_ACTIVE);
             break;
 
-        /* Physical Master Volume Up / Down Echoes */
-        case Z906_CMD_VOLUME_UP: {
-            z906_state_t cur;
-            z906_state_get(&cur);
-            z906_state_set_volume(cur.volume + 1);
-            break;
-        }
-        case Z906_CMD_VOLUME_DOWN: {
-            z906_state_t cur;
-            z906_state_get(&cur);
-            if (cur.volume > 0) z906_state_set_volume(cur.volume - 1);
-            break;
-        }
-
-        /* Physical Channel Trim Volume Echoes */
-        case Z906_CMD_VOLUME_BASS_UP: {
-            z906_state_t cur;
-            z906_state_get(&cur);
-            z906_state_set_trim(0, cur.volume_bass + 1);
-            break;
-        }
-        case Z906_CMD_VOLUME_BASS_DOWN: {
-            z906_state_t cur;
-            z906_state_get(&cur);
-            if (cur.volume_bass > 0) z906_state_set_trim(0, cur.volume_bass - 1);
-            break;
-        }
-        case Z906_CMD_VOLUME_CENTER_UP: {
-            z906_state_t cur;
-            z906_state_get(&cur);
-            z906_state_set_trim(1, cur.volume_center + 1);
-            break;
-        }
-        case Z906_CMD_VOLUME_CENTER_DOWN: {
-            z906_state_t cur;
-            z906_state_get(&cur);
-            if (cur.volume_center > 0) z906_state_set_trim(1, cur.volume_center - 1);
-            break;
-        }
-        case Z906_CMD_VOLUME_REAR_UP: {
-            z906_state_t cur;
-            z906_state_get(&cur);
-            z906_state_set_trim(2, cur.volume_rear + 1);
-            break;
-        }
-        case Z906_CMD_VOLUME_REAR_DOWN: {
-            z906_state_t cur;
-            z906_state_get(&cur);
-            if (cur.volume_rear > 0) z906_state_set_trim(2, cur.volume_rear - 1);
-            break;
-        }
-
-        /* Physical Input Selection Echoes (protocol.rst Section: Input selection) */
-        case Z906_CMD_SELECT_INPUT_1: z906_state_set_input(Z906_INPUT_SIX_CHANNEL_DIRECT); break;
-        case Z906_CMD_SELECT_INPUT_2: z906_state_set_input(Z906_INPUT_RCA_STEREO);          break;
-        case Z906_CMD_SELECT_INPUT_3: z906_state_set_input(Z906_INPUT_OPTICAL_1);           break;
-        case Z906_CMD_SELECT_INPUT_4: z906_state_set_input(Z906_INPUT_OPTICAL_2);           break;
-        case Z906_CMD_SELECT_INPUT_5: z906_state_set_input(Z906_INPUT_DIGITAL_COAXIAL);     break;
-        case Z906_CMD_SELECT_INPUT_6: z906_state_set_input(Z906_INPUT_AUXILIARY);           break;
-
-        /* Physical Effect Selection Echoes (protocol.rst Section: Effect selection) */
-        case Z906_CMD_SELECT_EFFECT_3D:   z906_state_set_effect(Z906_EFFECT_3D); break;
-        case Z906_CMD_SELECT_EFFECT_2_1:  z906_state_set_effect(Z906_EFFECT_2_1); break;
-        case Z906_CMD_SELECT_EFFECT_4_1:  z906_state_set_effect(Z906_EFFECT_4_1); break;
-        case Z906_CMD_SELECT_EFFECT_NONE: z906_state_set_effect(Z906_EFFECT_NONE); break;
-
         default:
-            /* Decode state check (0x17 to 0x1F, protocol.rst Section: Decode state) */
+            /* Other accepted echoes were already applied by the state store. */
             if (byte >= Z906_DECODE_5_1 && byte <= Z906_DECODE_UNKNOWN) {
                 ESP_LOGI(TAG, "Amplifier decode state: %s (0x%02X)",
                          z906_cmd_decode_state_str(byte), byte);
-                z906_state_set_digital_signal_status(byte);
             }
             break;
     }

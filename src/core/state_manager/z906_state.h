@@ -204,6 +204,16 @@ uint32_t z906_state_note_amp_rx_loss(uint32_t expected_cable_epoch);
  */
 bool z906_state_confirm_main_for_epoch(uint32_t expected_epoch);
 
+/**
+ * @brief Applies a verified standalone amplifier echo against BOTH physical
+ *        cable and RX-continuity generations, with one state mutex transaction.
+ *        No change or observer notification is emitted for stale epochs.
+ * @return true if recognized and current (even when already at its bound).
+ */
+bool z906_state_apply_amp_echo_for_generations(uint32_t expected_cable_epoch,
+                                               uint32_t expected_rx_stream_epoch,
+                                               uint8_t opcode);
+
 /** @brief Commits the complete, verified CONFIG state atomically only if the
  *         physical cable epoch still matches. No partial attr updates/observer
  *         notifications are emitted for stale queued frames.
