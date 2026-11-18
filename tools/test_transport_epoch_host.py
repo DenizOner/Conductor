@@ -78,6 +78,8 @@ void wdt_manager_reset(void);
 #pragma once
 #include <stdint.h>
 uint32_t z906_state_get_cable_epoch(void);
+uint32_t z906_state_get_amp_rx_stream_epoch(void);
+uint32_t z906_state_note_amp_rx_loss(uint32_t);
 """
 }
 
@@ -94,13 +96,21 @@ HARNESS = r"""
 #include "uart_hal.h"
 
 static jmp_buf s_stop;
-static uint32_t s_epoch;
-static unsigned s_cycles, s_flushes, s_rx_reads, s_posts;
+static uint32_t s_epoch, s_stream;
+static unsigned s_cycles, s_flushes, s_rx_reads, s_posts, s_losses;
+static bool s_status_valid = true;
 static z906_event_t s_recorded[4];
 static bool s_registered;
 
 int64_t esp_timer_get_time(void) { return 1000000LL + (int64_t)s_cycles * 1000000LL; }
 uint32_t z906_state_get_cable_epoch(void) { return s_epoch; }
+uint32_t z906_state_get_amp_rx_stream_epoch(void) { return s_stream; }
+uint32_t z906_state_note_amp_rx_loss(uint32_t epoch) {
+    assert(epoch == s_epoch);
+    ++s_losses;
+    s_status_valid = false; /* No later RX is needed to revoke health. */
+    return ++s_stream;
+}
 bool wdt_manager_register_task(void) { s_registered = true; return true; }
 void wdt_manager_reset(void) { assert(s_registered); }
 int z906_uart_hal_read_console(uint8_t *b, size_t n, TickType_t t) {
@@ -133,8 +143,12 @@ TaskHandle_t xTaskCreateStatic(void (*fn)(void *), const char *name,
 void vTaskDelay(TickType_t delay) {
     assert(delay > 0);
     ++s_cycles;
-    if (s_cycles == 1) s_epoch = 1;
-    if (s_cycles == 2) s_epoch = 2;
+    if (s_cycles == 1) { s_epoch = 1; ++s_stream; }
+    if (s_cycles == 2) { s_epoch = 2; ++s_stream; }
+    if (s_cycles == 3) {
+        /* Third post was lost: last-RX-drop proof must already be revoked. */
+        assert(s_losses == 1 && !s_status_valid);
+    }
     if (s_cycles == 4) longjmp(s_stop, 1);
 }
 int main(void) {
@@ -143,7 +157,7 @@ int main(void) {
         assert(!"the mock task should exit through the test jump");
     }
     assert(s_cycles == 4 && s_rx_reads == 4 && s_posts == 4);
-    assert(s_flushes == 2);
+    assert(s_flushes == 2 && s_losses == 1 && !s_status_valid);
     assert(s_recorded[0].cable_epoch == 0);
     assert(s_recorded[1].cable_epoch == 1);
     assert(s_recorded[2].cable_epoch == 2);
@@ -151,7 +165,7 @@ int main(void) {
     assert(s_recorded[1].rx_stream_epoch == s_recorded[0].rx_stream_epoch + 1);
     assert(s_recorded[2].rx_stream_epoch == s_recorded[1].rx_stream_epoch + 1);
     assert(s_recorded[3].rx_stream_epoch == s_recorded[2].rx_stream_epoch + 1);
-    puts("PASS: real UART transport cable flush and lost-RX generation");
+    puts("PASS: real UART transport immediate last-drop invalidation and epochs");
 }
 """
 

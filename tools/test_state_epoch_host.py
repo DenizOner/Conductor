@@ -191,6 +191,7 @@ def main():
             "cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
             "-I", str(root),
             "-I", str(ROOT / "src/core/state_manager"),
+            "-I", str(ROOT / "src/protocol/commands"),
             str(SOURCE), str(test), "-o", str(binary)
         ], check=True, cwd=ROOT)
         subprocess.run([str(binary)], check=True, cwd=ROOT)

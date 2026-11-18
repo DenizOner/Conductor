@@ -116,7 +116,11 @@ typedef struct {
 void z906_state_get(z906_state_t *);
 uint32_t z906_state_get_cable_epoch(void);
 bool z906_state_confirm_main_for_epoch(uint32_t);
-bool z906_state_apply_verified_config_for_epoch(uint32_t, const z906_state_t *);
+bool z906_state_apply_verified_config_for_epoch(uint32_t, uint32_t,
+                                                const z906_state_t *);
+uint32_t z906_state_get_amp_rx_stream_epoch(void);
+uint32_t z906_state_note_amp_rx_loss(uint32_t);
+bool z906_state_apply_amp_echo_for_generations(uint32_t, uint32_t, uint8_t);
 void z906_state_set_main_valid(bool);
 void z906_state_set_volume(uint8_t);
 void z906_state_set_trim(uint8_t, uint8_t);
@@ -149,8 +153,10 @@ static unsigned s_read, s_write;
 static bool s_drop_cable_events;
 static z906_state_t s_state = { .cable_connected = true };
 static uint32_t s_epoch = 1;
+static uint32_t s_stream = 0;
 static unsigned s_confirmed, s_ota_replies, s_forwarded;
 static unsigned s_invalidations, s_input_updates;
+static bool s_switch_during_console_write;
 
 static const uint8_t s_payload[20] = {
     10, 21, 21, 21, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 6, 1, 3, 0, 0, 0
@@ -172,6 +178,12 @@ bool event_bus_receive(z906_event_t *event, TickType_t wait) {
     return true;
 }
 uint32_t z906_state_get_cable_epoch(void) { return s_epoch; }
+uint32_t z906_state_get_amp_rx_stream_epoch(void) { return s_stream; }
+uint32_t z906_state_note_amp_rx_loss(uint32_t cable) {
+    assert(cable == s_epoch);
+    ++s_invalidations;
+    return ++s_stream;
+}
 void z906_state_get(z906_state_t *out) { *out = s_state; }
 void z906_state_set_main_valid(bool valid) {
     assert(!valid); ++s_invalidations;
@@ -181,14 +193,30 @@ bool z906_state_confirm_main_for_epoch(uint32_t e) {
     ++s_confirmed;
     return true;
 }
-bool z906_state_apply_verified_config_for_epoch(uint32_t e, const z906_state_t *cfg) {
-    if (!s_state.cable_connected || e != s_epoch || cfg == NULL) return false;
+bool z906_state_apply_verified_config_for_epoch(uint32_t e, uint32_t rx,
+                                                const z906_state_t *cfg) {
+    if (!s_state.cable_connected || e != s_epoch || rx != s_stream ||
+        cfg == NULL) return false;
     ++s_confirmed;
     ++s_input_updates;
     s_state.volume = cfg->volume;
     s_state.input = cfg->input;
     s_state.power = cfg->power;
     return true;
+}
+bool z906_state_apply_amp_echo_for_generations(uint32_t cable, uint32_t rx,
+                                               uint8_t cmd) {
+    if (!s_state.cable_connected || cable != s_epoch || rx != s_stream) {
+        return false;
+    }
+    switch (cmd) {
+        case 0x36: s_state.power = false; return true;
+        case 0x20: s_state.mute = true; return true;
+        case 0x21: s_state.mute = false; return true;
+        case 0x08: ++s_state.volume; return true;
+        case 0x03: s_state.input = Z906_INPUT_OPTICAL_1; ++s_input_updates; return true;
+        default: return false;
+    }
 }
 void z906_state_set_volume(uint8_t v) { s_state.volume = v; }
 void z906_state_set_trim(uint8_t i, uint8_t v) {
@@ -210,7 +238,15 @@ int z906_uart_hal_write_amp(const uint8_t *b, size_t n) {
     (void)b; return (int)n;
 }
 int z906_uart_hal_write_console(const uint8_t *b, size_t n) {
-    (void)b; s_forwarded += (unsigned)n; return (int)n;
+    (void)b;
+    s_forwarded += (unsigned)n;
+    if (s_switch_during_console_write) {
+        /* Interleave physical cable transition in the blocking UART write. */
+        s_switch_during_console_write = false;
+        ++s_epoch;
+        ++s_stream;
+    }
+    return (int)n;
 }
 void telemetry_notify_response_received(telemetry_query_id_t q, int64_t t) {
     (void)t;
@@ -255,9 +291,11 @@ int main(void) {
     s_drop_cable_events = true;
     s_state.cable_connected = false;
     s_epoch = 2;
+    ++s_stream;
     cable_notice(false);
     s_state.cable_connected = true;
     s_epoch = 3;
+    ++s_stream;
     cable_notice(true);
 
     /* Remaining old bytes must be forwarded but NEVER decoded as new state. */
@@ -266,7 +304,7 @@ int main(void) {
     assert(s_confirmed == 0 && s_ota_replies == 0);
 
     /* A complete frame from the new epoch can verify current hardware. */
-    push_config(0, 24, 3, 1);
+    push_config(0, 24, 3, s_stream);
     drain_all();
     assert(s_confirmed == 1 && s_ota_replies == 1);
     assert(s_forwarded == 48);
@@ -275,24 +313,48 @@ int main(void) {
      * no orphan payload byte can be interpreted as standalone input echo. */
     unsigned earlier_input_updates = s_input_updates;
     s_epoch = 4;
-    push_config(0, 10, 4, 1);
+    ++s_stream;
+    push_config(0, 10, 4, s_stream);
     drain_all();
-    push_config(11, 24, 4, 2); /* byte 10 was dropped by a full queue */
+    (void)z906_state_note_amp_rx_loss(4); /* Last dropped RX byte. */
+    push_config(11, 24, 4, s_stream); /* byte 10 was lost */
     drain_all();
     assert(s_confirmed == 1 && s_ota_replies == 1);
     assert(s_input_updates == earlier_input_updates);
-    assert(s_invalidations >= 2);
-    push_config(0, 24, 4, 2);
+    assert(s_invalidations == 1);
+    push_config(0, 24, 4, s_stream);
     drain_all();
     assert(s_confirmed == 2 && s_ota_replies == 2);
 
     /* A fully queued previous-epoch frame remains passthrough-only. */
-    push_config(0, 24, 4, 2);
+    push_config(0, 24, 4, s_stream);
     s_epoch = 5;
+    ++s_stream;
     drain_all();
     assert(s_confirmed == 2 && s_ota_replies == 2);
 
-    puts("PASS: real FSM+codec cable epochs (dropped events, orphan bytes, stale queue)");
+    /* E19F-02: a cable transition DURING raw forwarding must prevent
+     * the queued single-byte standby/mute/input echo from changing state. */
+    s_state.power = true;
+    s_state.mute = false;
+    s_state.input = Z906_INPUT_OPTICAL_1;
+    unsigned previous_input_updates = s_input_updates;
+    uint32_t old_epoch = s_epoch, old_stream = s_stream;
+    s_switch_during_console_write = true;
+    push_amp(0x36, old_epoch, old_stream);
+    drain_all();
+    assert(s_state.power && !s_state.mute);
+    assert(s_epoch == old_epoch + 1 && s_stream == old_stream + 1);
+    push_amp(0x20, old_epoch, old_stream); /* stale mute */
+    push_amp(0x03, old_epoch, old_stream); /* stale input */
+    drain_all();
+    assert(!s_state.mute && s_input_updates == previous_input_updates);
+    /* Confirm that a genuinely current single-byte echo remains functional. */
+    push_amp(0x20, s_epoch, s_stream);
+    drain_all();
+    assert(s_state.mute);
+
+    puts("PASS: FSM+codec cable loss, orphan bytes and atomic standalone epochs");
 }
 """
 

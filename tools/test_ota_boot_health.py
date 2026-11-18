@@ -212,6 +212,19 @@ int main(void) {
     advance(4);
     assert(s_valid_count == 0 && s_rollback_count == 1);
 
+    /* E19F-01: matched status at t=11, LAST dropped RX byte at t=14,
+     * then silence. Production state manager revokes both main validity
+     * and matched timestamp synchronously; this stub models that revocation. */
+    reset_case();
+    advance(11);
+    report_verified_status();
+    advance(3);
+    s_z906_ok = false;
+    s_status_at_us = 0;
+    advance(1);
+    assert(s_valid_count == 0 && s_rollback_count == 1);
+    assert(!ota_health_is_validated());
+
     /* No fallback image: no forced restart, no false validation or repeat abort. */
     reset_case();
     s_fallback_ok = false;
@@ -258,7 +271,7 @@ int main(void) {
     advance(15);
     assert(s_valid_count == 0 && s_rollback_count == 1);
 
-    puts("PASS: OTA runtime health C host harness (11 scenarios)");
+    puts("PASS: OTA runtime health C host harness (12 scenarios)");
     return 0;
 }
 """
