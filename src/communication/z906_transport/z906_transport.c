@@ -94,7 +94,7 @@ static void prv_uart_rx_task(void *pvParameters)
 
     uint8_t rx_byte = 0;
     uint32_t last_cable_epoch = z906_state_get_cable_epoch();
-    uint32_t amp_stream_epoch = 0;
+    uint32_t amp_stream_epoch = z906_state_get_amp_rx_stream_epoch();
 
     while (1) {
         wdt_manager_reset();
@@ -115,7 +115,7 @@ static void prv_uart_rx_task(void *pvParameters)
         if (read_epoch != last_cable_epoch) {
             z906_uart_hal_flush_amp_rx();
             last_cable_epoch = read_epoch;
-            ++amp_stream_epoch;
+            amp_stream_epoch = z906_state_get_amp_rx_stream_epoch();
         }
         /* Stamp the epoch BEFORE a potentially blocking UART read. If cable
          * changes mid-read, FSM will reject state from this old generation. */
@@ -128,8 +128,9 @@ static void prv_uart_rx_task(void *pvParameters)
                 .rx_stream_epoch = amp_stream_epoch
             };
             if (!event_bus_post(&evt, 0)) {
-                /* Dropped bytes cannot silently continue an in-flight frame. */
-                ++amp_stream_epoch;
+                /* Fail closed at the producer, even if this was the last RX
+                 * byte and the FSM never receives a new stream event. */
+                amp_stream_epoch = z906_state_note_amp_rx_loss(read_epoch);
             }
         }
 

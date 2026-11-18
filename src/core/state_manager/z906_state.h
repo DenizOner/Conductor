@@ -186,6 +186,19 @@ void z906_state_set_cable_status(bool connected);
  */
 uint32_t z906_state_get_cable_epoch(void);
 
+/** @brief Shared RX continuity generation, independent of EventBus delivery. */
+uint32_t z906_state_get_amp_rx_stream_epoch(void);
+
+/**
+ * @brief Invalidates confirmed status immediately after an amplifier RX drop.
+ *
+ * Called only by the UART RX owner after a failed amplifier-byte EventBus post;
+ * no subsequent RX byte is required to revoke OTA evidence. When the event
+ * belongs to an earlier cable session, the new session is not invalidated.
+ * @return Current shared RX stream generation.
+ */
+uint32_t z906_state_note_amp_rx_loss(uint32_t expected_cable_epoch);
+
 /** @brief Atomically confirms CONFIG only for the currently connected cable epoch.
  *         A queued reply from an earlier epoch cannot restore main_state_valid.
  */
@@ -196,6 +209,7 @@ bool z906_state_confirm_main_for_epoch(uint32_t expected_epoch);
  *         notifications are emitted for stale queued frames.
  */
 bool z906_state_apply_verified_config_for_epoch(uint32_t expected_epoch,
+                                                uint32_t expected_rx_stream_epoch,
                                                 const z906_state_t *verified);
 
 /**

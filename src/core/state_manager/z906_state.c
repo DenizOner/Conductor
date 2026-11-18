@@ -39,6 +39,10 @@ static int64_t s_last_main_status_time_us = 0;
 static int64_t s_last_matched_status_time_us = 0;
 /* Monotonic logical cable session, protected by the existing state mutex. */
 static uint32_t s_cable_epoch = 0;
+/* Shared receive continuity generation, protected by the existing state mutex.
+ * A failed EventBus post invalidates prior OTA proof immediately, even if no
+ * further amplifier byte reaches the FSM. */
+static uint32_t s_amp_rx_stream_epoch = 0;
 
 /* Single-slot observer — NULL if no observer is registered */
 static z906_state_change_cb_t s_change_observer = NULL;
@@ -98,6 +102,7 @@ void z906_state_init(void)
     s_last_main_status_time_us             = 0;
     s_last_matched_status_time_us          = 0;
     s_cable_epoch                          = 0;
+    s_amp_rx_stream_epoch                  = 0;
 
     ESP_LOGI(TAG, "Z906 state store initialized with defaults");
 }
@@ -391,6 +396,7 @@ void z906_state_set_cable_status(bool connected)
     }
     if (changed) {
         ++s_cable_epoch; /* Even if the EventBus cable event is dropped. */
+        ++s_amp_rx_stream_epoch; /* Physical session also breaks RX continuity. */
     }
     if (changed || !connected) {
         /* Each physical cable epoch requires a new verified CONFIG frame.
@@ -408,6 +414,43 @@ void z906_state_set_cable_status(bool connected)
     }
 }
 
+uint32_t z906_state_get_amp_rx_stream_epoch(void)
+{
+    if (s_state_mutex == NULL) {
+        return 0;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    uint32_t epoch = s_amp_rx_stream_epoch;
+    xSemaphoreGive(s_state_mutex);
+    return epoch;
+}
+
+uint32_t z906_state_note_amp_rx_loss(uint32_t expected_cable_epoch)
+{
+    if (s_state_mutex == NULL) {
+        return 0;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool affected = s_current_state.cable_connected &&
+                    s_cable_epoch == expected_cable_epoch;
+    bool was_valid = affected && s_current_state.main_state_valid;
+    if (affected) {
+        ++s_amp_rx_stream_epoch;
+        s_current_state.main_state_valid = false;
+        s_current_state.temp_valid = false;
+        s_last_main_status_time_us = 0;
+        s_last_matched_status_time_us = 0;
+    }
+    uint32_t current = s_amp_rx_stream_epoch;
+    xSemaphoreGive(s_state_mutex);
+    if (was_valid) {
+        /* Notify after the lock: stale hardware attributes must not be
+         * published just because the UART-to-EventBus bridge lost a byte. */
+        prv_notify_observer((1UL << 17) - 1UL);
+    }
+    return current;
+}
+
 uint32_t z906_state_get_cable_epoch(void)
 {
     if (s_state_mutex == NULL) {
@@ -420,6 +463,7 @@ uint32_t z906_state_get_cable_epoch(void)
 }
 
 bool z906_state_apply_verified_config_for_epoch(uint32_t epoch,
+                                                uint32_t rx_stream_epoch,
                                                 const z906_state_t *verified)
 {
     if (s_state_mutex == NULL || verified == NULL ||
@@ -435,9 +479,10 @@ bool z906_state_apply_verified_config_for_epoch(uint32_t epoch,
     }
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    bool accepted = s_current_state.cable_connected && s_cable_epoch == epoch;
+    bool accepted = s_current_state.cable_connected && s_cable_epoch == epoch &&
+                    s_amp_rx_stream_epoch == rx_stream_epoch;
     if (accepted) {
-        /* One commit: no reader or cable transition can observe a partial
+        /* One commit: no reader, cable transition or dropped RX byte can observe a partial
          * CONFIG field update or a validity flag for another cable epoch. */
         s_current_state.volume = verified->volume;
         s_current_state.volume_bass = verified->volume_bass;

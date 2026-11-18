@@ -51,7 +51,7 @@ bool z906_fsm_init(void)
     z906_codec_init(&s_amp_codec_ctx);
     s_amp_frame_started_us = 0;
     s_fsm_cable_epoch = z906_state_get_cable_epoch();
-    s_fsm_rx_stream_epoch = 0;
+    s_fsm_rx_stream_epoch = z906_state_get_amp_rx_stream_epoch();
     s_amp_resync_required = false;
     fsm_set_state(FSM_STATE_BOOTING);
     return true;
@@ -82,7 +82,8 @@ static void handle_console_byte(uint8_t byte)
     z906_uart_hal_write_amp(&byte, 1);
 }
 
-static void handle_amp_byte(uint8_t byte, int64_t received_at_us, uint32_t cable_epoch)
+static void handle_amp_byte(uint8_t byte, int64_t received_at_us,
+                            uint32_t cable_epoch, uint32_t rx_stream_epoch)
 {
     /* 1. Forward raw byte to physical console */
     z906_uart_hal_write_console(&byte, 1);
@@ -116,7 +117,7 @@ static void handle_amp_byte(uint8_t byte, int64_t received_at_us, uint32_t cable
                 confirmed.auto_standby_enabled = pkt.data.config.auto_standby_enabled;
                 /* The amplifier's Byte 17 defines true physical power. */
                 confirmed.power = !pkt.data.config.standby;
-                if (!z906_state_apply_verified_config_for_epoch(cable_epoch, &confirmed)) {
+                if (!z906_state_apply_verified_config_for_epoch(cable_epoch, rx_stream_epoch, &confirmed)) {
                     ESP_LOGW(TAG, "Discarding CONFIG from stale/unplugged cable epoch");
                     break;
                 }
@@ -264,15 +265,18 @@ static void handle_amp_byte(uint8_t byte, int64_t received_at_us, uint32_t cable
     }
 }
 
-static void fsm_sync_cable_epoch(void)
+static void fsm_sync_rx_generations(void)
 {
-    uint32_t current = z906_state_get_cable_epoch();
-    if (current != s_fsm_cable_epoch) {
-        /* Direct state generation, never a lossy EventBus cable notification. */
+    uint32_t cable = z906_state_get_cable_epoch();
+    uint32_t stream = z906_state_get_amp_rx_stream_epoch();
+    if (cable != s_fsm_cable_epoch || stream != s_fsm_rx_stream_epoch) {
+        /* Shared state, not lossy EventBus delivery, owns invalidation.
+         * An old queued CONFIG cannot resurrect status after a final drop. */
         z906_codec_init(&s_amp_codec_ctx);
         s_amp_frame_started_us = 0;
         s_amp_resync_required = true;
-        s_fsm_cable_epoch = current;
+        s_fsm_cable_epoch = cable;
+        s_fsm_rx_stream_epoch = stream;
     }
 }
 
@@ -280,7 +284,7 @@ void z906_fsm_step(TickType_t block_time)
 {
     z906_event_t event;
     bool received = event_bus_receive(&event, block_time);
-    fsm_sync_cable_epoch();
+    fsm_sync_rx_generations();
     if (!received) {
         return;
     }
@@ -291,22 +295,13 @@ void z906_fsm_step(TickType_t block_time)
             break;
 
         case EVENT_AMP_RX_BYTE:
-            if (event.cable_epoch != s_fsm_cable_epoch) {
+            if (event.cable_epoch != s_fsm_cable_epoch ||
+                event.rx_stream_epoch != s_fsm_rx_stream_epoch) {
                 /* Passthrough byte is preserved, but never decoded as new state. */
                 z906_uart_hal_write_console(&event.data.raw_byte, 1);
                 break;
             }
-            if (event.rx_stream_epoch != s_fsm_rx_stream_epoch) {
-                /* The UART-to-EventBus bridge dropped a byte or flushed RX. */
-                z906_codec_init(&s_amp_codec_ctx);
-                s_amp_frame_started_us = 0;
-                s_amp_resync_required = true;
-                s_fsm_rx_stream_epoch = event.rx_stream_epoch;
-                /* A missing byte makes previously confirmed RX continuity
-                 * untrustworthy even when the cable has not moved. */
-                z906_state_set_main_valid(false);
-            }
-            if (s_amp_resync_required && event.data.raw_byte != 0xAA) {
+             if (s_amp_resync_required && event.data.raw_byte != 0xAA) {
                 /* Preserve raw amplifier-to-console passthrough but never
                  * interpret an orphaned frame payload as a standalone echo. */
                 z906_uart_hal_write_console(&event.data.raw_byte, 1);
@@ -316,7 +311,7 @@ void z906_fsm_step(TickType_t block_time)
                 s_amp_resync_required = false;
             }
             handle_amp_byte(event.data.raw_byte, event.received_at_us,
-                            event.cable_epoch);
+                            event.cable_epoch, event.rx_stream_epoch);
             break;
 
         case EVENT_CABLE_STATUS_CHANGED: {
