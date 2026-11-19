@@ -173,7 +173,41 @@ int main(void) {
     assert(z906_state_apply_verified_config_for_epoch(second_epoch,
                z906_state_get_amp_rx_stream_epoch(), &new_config));
     assert(z906_state_get_main_status_time_us() == s_now);
-    puts("PASS: real state manager immediate RX loss and atomic standalone echo generations");
+
+    /* G-03: other decoded frames cannot resurrect state across RX loss. */
+    z906_state_init();
+    z906_state_set_cable_status(true);
+    uint32_t live_cable = z906_state_get_cable_epoch();
+    uint32_t live_rx = z906_state_get_amp_rx_stream_epoch();
+    int8_t temps[3] = { 22, 23, 24 };
+    int start_observers = s_observers;
+    assert(z906_state_apply_temperature_for_generations(live_cable, live_rx, temps));
+    z906_state_t temperature_only;
+    z906_state_get(&temperature_only);
+    assert(temperature_only.temp_valid && !temperature_only.main_state_valid);
+    assert(s_observers == start_observers + 1);
+    (void)z906_state_note_amp_rx_loss(live_cable);
+    z906_state_get(&temperature_only);
+    assert(!temperature_only.temp_valid && !temperature_only.main_state_valid);
+    assert(s_observers == start_observers + 2); /* G-04: temp-only observer */
+    int drop_observers = s_observers;
+    assert(!z906_state_apply_temperature_for_generations(live_cable, live_rx, temps));
+    assert(!z906_state_apply_idle_for_generations(live_cable, live_rx, 600));
+    assert(!z906_state_apply_input_level_for_generations(live_cable, live_rx, 777));
+    z906_state_get(&temperature_only);
+    assert(!temperature_only.temp_valid && temperature_only.idle_seconds == 0);
+    assert(temperature_only.input_signal_level == 0 && s_observers == drop_observers);
+    uint32_t next_rx = z906_state_get_amp_rx_stream_epoch();
+    assert(z906_state_apply_temperature_for_generations(live_cable, next_rx, temps));
+    assert(z906_state_apply_idle_for_generations(live_cable, next_rx, 600));
+    assert(z906_state_apply_input_level_for_generations(live_cable, next_rx, 777));
+    z906_state_get(&temperature_only);
+    assert(temperature_only.temp_valid && temperature_only.idle_seconds == 600);
+    assert(temperature_only.input_signal_level == 777);
+    z906_state_set_cable_status(false);
+    assert(!z906_state_apply_temperature_for_generations(live_cable, next_rx, temps));
+
+    puts("PASS: production state manager RX epochs, temp-only observer and telemetry recovery");
 }
 """
 

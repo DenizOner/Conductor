@@ -107,11 +107,13 @@ typedef enum {
 } z906_effect_t;
 #include "z906_commands.h"
 typedef struct {
-    bool cable_connected, power, mute, auto_standby_enabled;
+    bool cable_connected, power, mute, auto_standby_enabled, temp_valid;
     uint8_t volume, volume_bass, volume_center, volume_rear;
     uint8_t digital_signal_status;
     z906_input_t input;
     z906_effect_t effect;
+    int8_t temp_celsius[3];
+    uint32_t idle_seconds, input_signal_level;
 } z906_state_t;
 void z906_state_get(z906_state_t *);
 uint32_t z906_state_get_cable_epoch(void);
@@ -133,6 +135,9 @@ void z906_state_set_power(bool);
 void z906_state_set_temperature(const int8_t *);
 void z906_state_set_idle_seconds(uint32_t);
 void z906_state_set_input_signal_level(uint32_t);
+bool z906_state_apply_temperature_for_generations(uint32_t, uint32_t, const int8_t *);
+bool z906_state_apply_idle_for_generations(uint32_t, uint32_t, uint32_t);
+bool z906_state_apply_input_level_for_generations(uint32_t, uint32_t, uint32_t);
 """
 }
 
@@ -157,6 +162,7 @@ static uint32_t s_stream = 0;
 static unsigned s_confirmed, s_ota_replies, s_forwarded;
 static unsigned s_invalidations, s_input_updates;
 static bool s_switch_during_console_write;
+static unsigned s_interleave_after_console_bytes;
 
 static const uint8_t s_payload[20] = {
     10, 21, 21, 21, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 6, 1, 3, 0, 0, 0
@@ -233,6 +239,23 @@ void z906_state_set_power(bool v) { s_state.power = v; }
 void z906_state_set_temperature(const int8_t *v) { (void)v; }
 void z906_state_set_idle_seconds(uint32_t v) { (void)v; }
 void z906_state_set_input_signal_level(uint32_t v) { (void)v; }
+bool z906_state_apply_temperature_for_generations(uint32_t cable, uint32_t rx,
+                                                  const int8_t *v) {
+    if (cable != s_epoch || rx != s_stream || !s_state.cable_connected) return false;
+    for (int i = 0; i < 3; i++) s_state.temp_celsius[i] = v[i];
+    s_state.temp_valid = true;
+    return true;
+}
+bool z906_state_apply_idle_for_generations(uint32_t cable, uint32_t rx, uint32_t v) {
+    if (cable != s_epoch || rx != s_stream || !s_state.cable_connected) return false;
+    s_state.idle_seconds = v;
+    return true;
+}
+bool z906_state_apply_input_level_for_generations(uint32_t cable, uint32_t rx, uint32_t v) {
+    if (cable != s_epoch || rx != s_stream || !s_state.cable_connected) return false;
+    s_state.input_signal_level = v;
+    return true;
+}
 const char *z906_cmd_decode_state_str(uint8_t v) { (void)v; return "MOCK"; }
 int z906_uart_hal_write_amp(const uint8_t *b, size_t n) {
     (void)b; return (int)n;
@@ -240,8 +263,9 @@ int z906_uart_hal_write_amp(const uint8_t *b, size_t n) {
 int z906_uart_hal_write_console(const uint8_t *b, size_t n) {
     (void)b;
     s_forwarded += (unsigned)n;
-    if (s_switch_during_console_write) {
-        /* Interleave physical cable transition in the blocking UART write. */
+    if (s_switch_during_console_write ||
+        (s_interleave_after_console_bytes > 0 && --s_interleave_after_console_bytes == 0)) {
+        /* Interrupt UART console forwarding on the FINAL packet byte. */
         s_switch_during_console_write = false;
         ++s_epoch;
         ++s_stream;
@@ -274,6 +298,14 @@ static void push_config(unsigned begin, unsigned end, uint32_t epoch, uint32_t s
     for (unsigned i = begin; i < end; ++i) {
         push_amp(frame[i], epoch, stream);
     }
+}
+static void push_multi(uint8_t type, uint8_t len, const uint8_t *payload,
+                       uint32_t epoch, uint32_t rx) {
+    push_amp(0xAA, epoch, rx);
+    push_amp(type, epoch, rx);
+    push_amp(len, epoch, rx);
+    for (unsigned i = 0; i < len; i++) push_amp(payload[i], epoch, rx);
+    push_amp(z906_codec_calc_frame_lrc(type, len, payload, len), epoch, rx);
 }
 static void cable_notice(bool connected) {
     z906_event_t e = { .type = EVENT_CABLE_STATUS_CHANGED };
@@ -357,7 +389,37 @@ int main(void) {
     drain_all();
     assert(s_state.mute);
 
-    puts("PASS: FSM+codec cable loss, orphan bytes and atomic standalone epochs");
+    /* G-03: a transition at the LAST byte of a valid multi-byte telemetry
+     * frame must not write stale TEMP, IDLE or INPUT_VOL state. */
+    static const uint8_t temp[5] = { 0, 22, 23, 24, 0 };
+    static const uint8_t idle[3] = { 0, 1, 44 };
+    static const uint8_t input_vol[3] = { 0, 3, 33 };
+    const uint8_t packet_types[3] = { 0x0C, 0x0F, 0x08 };
+    const uint8_t packet_sizes[3] = { 5, 3, 3 };
+    const uint8_t *packets[3] = { temp, idle, input_vol };
+    for (unsigned i = 0; i < 3; i++) {
+        uint32_t old_cable = s_epoch, old_rx = s_stream;
+        unsigned packet_bytes = 3u + packet_sizes[i] + 1u;
+        s_interleave_after_console_bytes = packet_bytes;
+        push_multi(packet_types[i], packet_sizes[i], packets[i], old_cable, old_rx);
+        drain_all();
+        assert(s_epoch == old_cable + 1 && s_stream == old_rx + 1);
+        assert(!s_state.temp_valid && s_state.idle_seconds == 0 &&
+               s_state.input_signal_level == 0);
+        /* A fresh full frame resynchronizes and is accepted in this epoch. */
+        push_multi(packet_types[i], packet_sizes[i], packets[i], s_epoch, s_stream);
+        drain_all();
+        if (i == 0) {
+            assert(s_state.temp_valid && s_state.temp_celsius[0] == 22);
+            s_state.temp_valid = false; /* Reset only the mock for next iteration. */
+        } else if (i == 1) {
+            assert(s_state.idle_seconds == 300);
+            s_state.idle_seconds = 0;
+        } else {
+            assert(s_state.input_signal_level == 801);
+        }
+    }
+    puts("PASS: FSM+codec cable loss, orphan RX, atomic multi-byte telemetry");
 }
 """
 

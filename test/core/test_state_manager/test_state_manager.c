@@ -214,6 +214,44 @@ void test_standalone_echo_requires_current_cable_and_rx_epochs(void)
     TEST_ASSERT_TRUE(after.mute);
 }
 
+/** @brief A stale temperature frame cannot revive validity after RX drop. */
+void test_temperature_only_drop_notifies_and_rejects_stale_telemetry(void)
+{
+    z906_state_set_cable_status(true);
+    uint32_t cable = z906_state_get_cable_epoch();
+    uint32_t rx = z906_state_get_amp_rx_stream_epoch();
+    const int8_t temperatures[3] = { 21, 22, 23 };
+
+    TEST_ASSERT_TRUE(z906_state_apply_temperature_for_generations(cable, rx, temperatures));
+    z906_state_t before;
+    z906_state_get(&before);
+    TEST_ASSERT_TRUE(before.temp_valid);
+    TEST_ASSERT_FALSE(before.main_state_valid);
+
+    uint32_t next = z906_state_note_amp_rx_loss(cable);
+    z906_state_t invalid;
+    z906_state_get(&invalid);
+    TEST_ASSERT_FALSE(invalid.temp_valid);
+    TEST_ASSERT_FALSE(invalid.main_state_valid);
+    TEST_ASSERT_EQUAL_UINT32(rx + 1, next);
+
+    TEST_ASSERT_FALSE(z906_state_apply_temperature_for_generations(cable, rx, temperatures));
+    TEST_ASSERT_FALSE(z906_state_apply_idle_for_generations(cable, rx, 180));
+    TEST_ASSERT_FALSE(z906_state_apply_input_level_for_generations(cable, rx, 999));
+    z906_state_get(&invalid);
+    TEST_ASSERT_FALSE(invalid.temp_valid);
+    TEST_ASSERT_EQUAL_UINT32(0, invalid.idle_seconds);
+    TEST_ASSERT_EQUAL_UINT32(0, invalid.input_signal_level);
+
+    TEST_ASSERT_TRUE(z906_state_apply_temperature_for_generations(cable, next, temperatures));
+    TEST_ASSERT_TRUE(z906_state_apply_idle_for_generations(cable, next, 180));
+    TEST_ASSERT_TRUE(z906_state_apply_input_level_for_generations(cable, next, 999));
+    z906_state_get(&invalid);
+    TEST_ASSERT_TRUE(invalid.temp_valid);
+    TEST_ASSERT_EQUAL_UINT32(180, invalid.idle_seconds);
+    TEST_ASSERT_EQUAL_UINT32(999, invalid.input_signal_level);
+}
+
 void test_state_defaults(void)
 {
     /* State container struct */
@@ -678,6 +716,7 @@ int runUnityTests(void)
     RUN_TEST(test_config_atomic_commit_rejects_old_epoch_without_state_changes);
     RUN_TEST(test_last_amp_rx_drop_invalidates_matched_status_immediately);
     RUN_TEST(test_standalone_echo_requires_current_cable_and_rx_epochs);
+    RUN_TEST(test_temperature_only_drop_notifies_and_rejects_stale_telemetry);
     RUN_TEST(test_matched_status_requires_live_query_and_cable);
     RUN_TEST(test_state_volume_boundaries);
     RUN_TEST(test_state_input_transitions);
