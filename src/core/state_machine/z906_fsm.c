@@ -33,16 +33,49 @@ static uint32_t s_fsm_rx_stream_epoch = 0;
 /* After RX stream loss, ignore payload-looking standalone opcodes until AA. */
 static bool s_amp_resync_required = false;
 
+/* Public diagnostics must reflect the current verified physical snapshot,
+ * never a delayed FSM transition from an old cable/RX epoch. */
+static z906_fsm_state_t fsm_derive_physical_state(void)
+{
+    if (s_fsm_state == FSM_STATE_UNINITIALIZED ||
+        s_fsm_state == FSM_STATE_SPEAKER_TEST) {
+        return s_fsm_state;
+    }
+    z906_ota_status_snapshot_t ready = { 0 };
+    if (!z906_state_get_ota_status_snapshot(&ready)) {
+        return s_fsm_state; /* State service not initialized yet. */
+    }
+    z906_state_t physical;
+    z906_state_get(&physical);
+    if (!physical.cable_connected || !physical.main_state_valid) {
+        return FSM_STATE_FAULT; /* No verified amplifier state. */
+    }
+    if (!physical.power) {
+        return FSM_STATE_STANDBY;
+    }
+    return physical.mute ? FSM_STATE_MUTED : FSM_STATE_ACTIVE;
+}
+
 static void fsm_set_state(z906_fsm_state_t new_state)
 {
+    /* CONFIG/echo state writes are atomic, but scheduling can change RX epoch
+     * between that commit and this diagnostic transition. Reconcile here. */
+    if (new_state == FSM_STATE_ACTIVE || new_state == FSM_STATE_MUTED ||
+        new_state == FSM_STATE_STANDBY) {
+        new_state = fsm_derive_physical_state();
+    }
     if (s_fsm_state != new_state) {
         ESP_LOGI(TAG, "State transition: %s -> %s",
                  z906_fsm_state_str(s_fsm_state), z906_fsm_state_str(new_state));
         s_fsm_state = new_state;
 
-        /* Broadcast state change event to notification subscribers */
-        z906_event_t evt = { .type = EVENT_STATE_CHANGED };
-        event_bus_post(&evt, 0);
+        /* If a higher-priority RX loss invalidated proof during this log,
+         * don't publish an obsolete transition. State observers operate
+         * separately on coherent physical state, not on this event's cache. */
+        if (fsm_derive_physical_state() == new_state) {
+            z906_event_t evt = { .type = EVENT_STATE_CHANGED };
+            event_bus_post(&evt, 0);
+        }
     }
 }
 
@@ -59,7 +92,9 @@ bool z906_fsm_init(void)
 
 z906_fsm_state_t z906_fsm_get_state(void)
 {
-    return s_fsm_state;
+    /* A concurrent cable/RX loss cannot leave public FSM diagnostics ACTIVE
+     * just because the event queue has not yet delivered its next item. */
+    return fsm_derive_physical_state();
 }
 
 const char *z906_fsm_state_str(z906_fsm_state_t state)
@@ -221,6 +256,8 @@ static void fsm_sync_rx_generations(void)
         s_amp_resync_required = true;
         s_fsm_cable_epoch = cable;
         s_fsm_rx_stream_epoch = stream;
+        /* Reconcile even if the cable notification was dropped. */
+        fsm_set_state(fsm_derive_physical_state());
     }
 }
 
