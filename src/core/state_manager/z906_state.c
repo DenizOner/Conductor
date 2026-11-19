@@ -310,6 +310,81 @@ bool z906_state_set_auto_standby(bool enabled)
     return changed;
 }
 
+/* Called only while s_state_mutex is held. */
+static bool prv_amp_rx_generations_match(uint32_t cable_epoch, uint32_t stream_epoch)
+{
+    return s_current_state.cable_connected &&
+           s_cable_epoch == cable_epoch &&
+           s_amp_rx_stream_epoch == stream_epoch;
+}
+
+bool z906_state_apply_temperature_for_generations(uint32_t cable_epoch,
+                                                   uint32_t stream_epoch,
+                                                   const int8_t temps[3])
+{
+    if (temps == NULL || s_state_mutex == NULL) {
+        return false;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool accepted = prv_amp_rx_generations_match(cable_epoch, stream_epoch);
+    bool changed = false;
+    if (accepted) {
+        changed = !s_current_state.temp_valid;
+        for (int i = 0; i < 3; i++) {
+            if (s_current_state.temp_celsius[i] != temps[i]) {
+                s_current_state.temp_celsius[i] = temps[i];
+                changed = true;
+            }
+        }
+        s_current_state.temp_valid = true;
+    }
+    xSemaphoreGive(s_state_mutex);
+    if (accepted && changed) {
+        prv_notify_observer((1UL << 14) | (1UL << 15) | (1UL << 16));
+    }
+    return accepted;
+}
+
+bool z906_state_apply_idle_for_generations(uint32_t cable_epoch,
+                                           uint32_t stream_epoch,
+                                           uint32_t seconds)
+{
+    if (s_state_mutex == NULL) {
+        return false;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool accepted = prv_amp_rx_generations_match(cable_epoch, stream_epoch);
+    bool changed = accepted && s_current_state.idle_seconds != seconds;
+    if (changed) {
+        s_current_state.idle_seconds = seconds;
+    }
+    xSemaphoreGive(s_state_mutex);
+    if (changed) {
+        prv_notify_observer(1UL << 9);
+    }
+    return accepted;
+}
+
+bool z906_state_apply_input_level_for_generations(uint32_t cable_epoch,
+                                                  uint32_t stream_epoch,
+                                                  uint32_t level)
+{
+    if (s_state_mutex == NULL) {
+        return false;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool accepted = prv_amp_rx_generations_match(cable_epoch, stream_epoch);
+    bool changed = accepted && s_current_state.input_signal_level != level;
+    if (changed) {
+        s_current_state.input_signal_level = level;
+    }
+    xSemaphoreGive(s_state_mutex);
+    if (changed) {
+        prv_notify_observer(1UL << 8);
+    }
+    return accepted;
+}
+
 bool z906_state_set_temperature(const int8_t temps[3])
 {
     if (temps == NULL || s_state_mutex == NULL) {
@@ -434,7 +509,9 @@ uint32_t z906_state_note_amp_rx_loss(uint32_t expected_cable_epoch)
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     bool affected = s_current_state.cable_connected &&
                     s_cable_epoch == expected_cable_epoch;
-    bool was_valid = affected && s_current_state.main_state_valid;
+    /* Temperature is an independent Zigbee validity channel. */
+    bool was_valid = affected && (s_current_state.main_state_valid ||
+                                  s_current_state.temp_valid);
     if (affected) {
         ++s_amp_rx_stream_epoch;
         s_current_state.main_state_valid = false;
@@ -445,8 +522,9 @@ uint32_t z906_state_note_amp_rx_loss(uint32_t expected_cable_epoch)
     uint32_t current = s_amp_rx_stream_epoch;
     xSemaphoreGive(s_state_mutex);
     if (was_valid) {
-        /* Notify after the lock: stale hardware attributes must not be
-         * published just because the UART-to-EventBus bridge lost a byte. */
+        /* Notify even when ONLY temperature was valid: the publisher must
+         * replace a stale temperature with its invalid sentinel immediately.
+         * Observer is always invoked outside the state mutex. */
         prv_notify_observer((1UL << 17) - 1UL);
     }
     return current;

@@ -142,20 +142,29 @@ static void handle_amp_byte(uint8_t byte, int64_t received_at_us,
                 }
                 ESP_LOGI(TAG, "Confirmed Amp Temperatures: [%d, %d, %d] \xc2\xb0""C",
                          pkt.data.temp.temp_celsius[0], pkt.data.temp.temp_celsius[1], pkt.data.temp.temp_celsius[2]);
-                z906_state_set_temperature(pkt.data.temp.temp_celsius);
-                telemetry_notify_response_received(TELEMETRY_QUERY_TEMP, s_amp_frame_started_us);
+                if (z906_state_apply_temperature_for_generations(
+                        cable_epoch, rx_stream_epoch, pkt.data.temp.temp_celsius)) {
+                    telemetry_notify_response_received(TELEMETRY_QUERY_TEMP,
+                                                       s_amp_frame_started_us);
+                }
                 break;
 
             case Z906_PACKET_IDLE:
                 ESP_LOGD(TAG, "Confirmed Amp Idle Duration: %lu s", (unsigned long)pkt.data.idle.idle_seconds);
-                z906_state_set_idle_seconds(pkt.data.idle.idle_seconds);
-                telemetry_notify_response_received(TELEMETRY_QUERY_IDLE, s_amp_frame_started_us);
+                if (z906_state_apply_idle_for_generations(
+                        cable_epoch, rx_stream_epoch, pkt.data.idle.idle_seconds)) {
+                    telemetry_notify_response_received(TELEMETRY_QUERY_IDLE,
+                                                       s_amp_frame_started_us);
+                }
                 break;
 
             case Z906_PACKET_INPUT_VOL:
                 ESP_LOGD(TAG, "Confirmed Amp Input Signal Level: %lu", (unsigned long)pkt.data.input_vol.input_volume);
-                z906_state_set_input_signal_level(pkt.data.input_vol.input_volume);
-                telemetry_notify_response_received(TELEMETRY_QUERY_INPUT_VOL, s_amp_frame_started_us);
+                if (z906_state_apply_input_level_for_generations(
+                        cable_epoch, rx_stream_epoch, pkt.data.input_vol.input_volume)) {
+                    telemetry_notify_response_received(TELEMETRY_QUERY_INPUT_VOL,
+                                                       s_amp_frame_started_us);
+                }
                 break;
 
             default:

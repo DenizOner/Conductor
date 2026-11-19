@@ -161,6 +161,20 @@ bool z906_state_set_auto_standby(bool enabled);
  */
 bool z906_state_set_temperature(const int8_t temps[3]);
 
+/** @brief Apply fully decoded amp telemetry only in the current cable and RX
+ *         generations. Check and write share the existing state mutex.
+ * @return true when the packet was accepted, even if values were unchanged.
+ */
+bool z906_state_apply_temperature_for_generations(uint32_t cable_epoch,
+                                                   uint32_t stream_epoch,
+                                                   const int8_t temps[3]);
+bool z906_state_apply_idle_for_generations(uint32_t cable_epoch,
+                                           uint32_t stream_epoch,
+                                           uint32_t seconds);
+bool z906_state_apply_input_level_for_generations(uint32_t cable_epoch,
+                                                  uint32_t stream_epoch,
+                                                  uint32_t level);
+
 /**
  * @brief Updates amplifier idle seconds telemetry.
  * @param seconds Idle seconds.
