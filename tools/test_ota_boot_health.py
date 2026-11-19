@@ -87,6 +87,13 @@ bool zigbee_device_model_is_registered(void);
 #pragma once
 #include <stdbool.h>
 bool z906_state_is_main_valid(void);
+typedef struct {
+    bool main_valid;
+    uint32_t cable_epoch;
+    uint32_t rx_stream_epoch;
+    int64_t matched_status_us;
+} z906_ota_status_snapshot_t;
+bool z906_state_get_ota_status_snapshot(z906_ota_status_snapshot_t *);
 int64_t z906_state_get_main_status_time_us(void);
 int64_t z906_state_get_matched_status_reply_time_us(void);
 """,
@@ -114,6 +121,7 @@ HARNESS = r"""
 static int64_t s_now = 1000000;
 static bool s_z906_ok;
 static int64_t s_status_at_us;
+static uint32_t s_rx_epoch;
 static bool s_zigbee_ok;
 static bool s_fallback_ok;
 static esp_err_t s_rollback_result = ESP_OK;
@@ -134,6 +142,14 @@ zb_stack_state_t zigbee_native_stack_get_state(void) {
 }
 bool zigbee_device_model_is_registered(void) { return s_zigbee_ok; }
 bool z906_state_is_main_valid(void) { return s_z906_ok; }
+bool z906_state_get_ota_status_snapshot(z906_ota_status_snapshot_t *out) {
+    if (!out) return false;
+    out->main_valid = s_z906_ok;
+    out->cable_epoch = 1;
+    out->rx_stream_epoch = s_rx_epoch;
+    out->matched_status_us = s_z906_ok ? s_status_at_us : 0;
+    return true;
+}
 int64_t z906_state_get_main_status_time_us(void) { return s_z906_ok ? s_status_at_us : 0; }
 int64_t z906_state_get_matched_status_reply_time_us(void) { return s_z906_ok ? s_status_at_us : 0; }
 void led_notification_post_cmd_result(bool success) { (void)success; }
@@ -154,6 +170,7 @@ static void reset_case(void) {
     s_now = 1000000;
     s_z906_ok = false;
     s_status_at_us = 0;
+    s_rx_epoch = 0;
     s_zigbee_ok = true;
     s_nvs_ok = true;
     s_fallback_ok = true;
@@ -172,6 +189,16 @@ static void advance(unsigned seconds) {
 static void report_verified_status(void) {
     s_z906_ok = true;
     s_status_at_us = s_now;
+}
+static void drop_after_pass_before_mark_valid(void) {
+    /* Simulates RX owner preempting finalization after the criteria PASS. */
+    s_z906_ok = false;
+    s_status_at_us = 0;
+    ++s_rx_epoch;
+}
+static void change_epoch_after_pass(void) {
+    /* Even a stale unchanged status timestamp cannot cross generations. */
+    ++s_rx_epoch;
 }
 int main(void) {
     /* 15 s with no verified amplifier frame must roll back. */
@@ -225,6 +252,34 @@ int main(void) {
     assert(s_valid_count == 0 && s_rollback_count == 1);
     assert(!ota_health_is_validated());
 
+    /* H-05: PASS at 15s, then LAST RX drop after finalization claim but
+     * BEFORE irreversible SDK approval. No permanent VALID is permitted. */
+    reset_case();
+    advance(11);
+    report_verified_status();
+    ota_health_set_before_final_admission_fn_for_test(drop_after_pass_before_mark_valid);
+    advance(4);
+    assert(s_valid_count == 0 && s_rollback_count == 1 && s_failure_count == 1);
+    assert(!ota_health_is_validated());
+
+    /* An RX epoch change without changing the test timestamp also fails. */
+    reset_case();
+    advance(11);
+    report_verified_status();
+    ota_health_set_before_final_admission_fn_for_test(change_epoch_after_pass);
+    advance(4);
+    assert(s_valid_count == 0 && s_rollback_count == 1);
+
+    /* H-05: if no fallback exists, do not flash VALID or restart-loop. */
+    reset_case();
+    s_fallback_ok = false;
+    advance(11);
+    report_verified_status();
+    ota_health_set_before_final_admission_fn_for_test(drop_after_pass_before_mark_valid);
+    advance(4);
+    assert(s_valid_count == 0 && s_rollback_count == 0);
+    assert(ota_health_get_recovery_state() == OTA_HEALTH_RECOVERY_NO_FALLBACK);
+
     /* No fallback image: no forced restart, no false validation or repeat abort. */
     reset_case();
     s_fallback_ok = false;
@@ -271,7 +326,7 @@ int main(void) {
     advance(15);
     assert(s_valid_count == 0 && s_rollback_count == 1);
 
-    puts("PASS: OTA runtime health C host harness (12 scenarios)");
+    puts("PASS: OTA runtime health C host harness (15 scenarios)");
     return 0;
 }
 """
