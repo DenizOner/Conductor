@@ -42,6 +42,9 @@ static ota_health_bool_fn_t s_nvs_healthy_fn_for_test = NULL;
 static ota_health_bool_fn_t s_twdt_healthy_fn_for_test = NULL;
 static bool s_telemetry_twdt_feed_ok = false;
 static bool s_finalization_in_progress = false;
+/* Rollback requests during a cancellable admission must never disappear. */
+static bool s_rollback_requested_during_admission = false;
+static bool s_mark_valid_sdk_started = false;
 static ota_health_recovery_state_t s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
 /* Short state snapshots only: SDK / NVS / OTA APIs are NEVER called under this spinlock. */
 static portMUX_TYPE s_health_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -51,6 +54,8 @@ static uint32_t s_sampled_cable_epoch = 0;
 static uint32_t s_sampled_rx_stream_epoch = 0;
 /* Test seam: inject a drop after PASS and finalization claim, before admission. */
 static ota_health_void_fn_t s_before_final_admission_fn_for_test = NULL;
+/* Deterministic interleaving after the first proof check, before SDK handoff. */
+static ota_health_void_fn_t s_before_sdk_handoff_fn_for_test = NULL;
 
 static int64_t ota_health_now_us(void)
 {
@@ -76,6 +81,8 @@ bool ota_health_init(void)
     s_is_pending_verify = false;
     s_rollback_handled = false;
     s_finalization_in_progress = false;
+    s_rollback_requested_during_admission = false;
+    s_mark_valid_sdk_started = false;
     s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
     s_rollback_detected = false;
     s_sampled_cable_epoch = 0;
@@ -217,6 +224,8 @@ void ota_health_process_cycle(uint32_t elapsed_sec)
                        !s_rollback_handled && !s_finalization_in_progress;
         if (claimed) {
             s_finalization_in_progress = true;
+            s_mark_valid_sdk_started = false;
+            s_rollback_requested_during_admission = false;
         }
         portEXIT_CRITICAL(&s_health_mux);
         if (!claimed) {
@@ -252,10 +261,45 @@ void ota_health_process_cycle(uint32_t elapsed_sec)
             return;
         }
 
-        /* Linearization point: status is admitted here, immediately before
-         * invoking the irreversible SDK mark-valid API. A loss AFTER the SDK
-         * call starts cannot retroactively cancel an otadata write. */
-        ESP_LOGI(TAG, "HEALTH CHECK PASSED! Live Z906 proof rechecked.");
+        /* A second interleaving point covers manual rollback/RX loss after
+         * the first snapshot, but before the final SDK admission claim. */
+        if (s_before_sdk_handoff_fn_for_test != NULL) {
+            s_before_sdk_handoff_fn_for_test();
+        }
+        z906_ota_status_snapshot_t last = { 0 };
+        bool last_read = z906_state_get_ota_status_snapshot(&last);
+        int64_t last_now = ota_health_now_us();
+        int64_t last_status = s_status_time_fn_for_test != NULL
+            ? s_status_time_fn_for_test() : last.matched_status_us;
+        bool last_proof_ok = last_read && last.main_valid &&
+            last.cable_epoch == live.cable_epoch &&
+            last.rx_stream_epoch == live.rx_stream_epoch &&
+            last_status > s_validation_start_us &&
+            last_status <= last_now &&
+            (last_now - last_status) <= OTA_Z906_STATUS_MAX_AGE_US;
+
+        /* No OTA/flash/NVS call while holding this short static critical
+         * section; only the software admission/rollback arbitration lives here. */
+        portENTER_CRITICAL(&s_health_mux);
+        bool cancel_commit = !last_proof_ok || s_rollback_requested_during_admission;
+        if (cancel_commit) {
+            s_finalization_in_progress = false;
+            s_rollback_requested_during_admission = false;
+            s_criteria.z906_comm_healthy = false;
+            ota_health_refresh_mask_from_criteria();
+        } else {
+            s_mark_valid_sdk_started = true;
+        }
+        portEXIT_CRITICAL(&s_health_mux);
+        if (cancel_commit) {
+            ota_client_note_health_failure("Final OTA admission revoked by RX loss or rollback");
+            ota_health_trigger_rollback("Rollback request or Z906 proof lost at SDK handoff");
+            return;
+        }
+
+        /* Explicit software admission boundary, with no intervening log.
+         * A preemption in the tiny interval to the physical SDK call remains
+         * possible: it is NOT falsely represented as a hardware guarantee. */
         esp_err_t err = s_mark_valid_fn_for_test != NULL
             ? s_mark_valid_fn_for_test()
             : esp_ota_mark_app_valid_cancel_rollback();
@@ -264,8 +308,14 @@ void ota_health_process_cycle(uint32_t elapsed_sec)
             s_is_validated = true;
             s_is_pending_verify = false;
         }
+        bool too_late_rollback = s_recovery_state == OTA_HEALTH_RECOVERY_REQUEST_TOO_LATE;
         s_finalization_in_progress = false;
+        s_mark_valid_sdk_started = false;
+        s_rollback_requested_during_admission = false;
         portEXIT_CRITICAL(&s_health_mux);
+        if (too_late_rollback) {
+            ESP_LOGE(TAG, "Rollback requested after OTA admission; manual recovery decision required");
+        }
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "SUCCESS: Firmware upgrade permanently COMMITTED!");
             led_notification_post_cmd_result(true);
@@ -291,12 +341,31 @@ bool ota_health_is_pending_verify(void)
 void ota_health_trigger_rollback(const char *reason)
 {
     portENTER_CRITICAL(&s_health_mux);
-    bool already_handled = s_rollback_handled || s_finalization_in_progress;
-    if (!already_handled) {
+    bool already_handled = s_rollback_handled;
+    bool queued = false;
+    bool too_late = false;
+    if (!already_handled && s_finalization_in_progress) {
+        if (!s_mark_valid_sdk_started) {
+            s_rollback_requested_during_admission = true;
+            s_recovery_state = OTA_HEALTH_RECOVERY_ROLLBACK_QUEUED;
+            queued = true;
+        } else {
+            s_recovery_state = OTA_HEALTH_RECOVERY_REQUEST_TOO_LATE;
+            too_late = true;
+        }
+    } else if (!already_handled) {
         s_rollback_handled = true;
     }
     portEXIT_CRITICAL(&s_health_mux);
     if (already_handled) {
+        return;
+    }
+    if (queued) {
+        ESP_LOGW(TAG, "Rollback queued: auto OTA approval must abort before mark-valid");
+        return;
+    }
+    if (too_late) {
+        ESP_LOGE(TAG, "Rollback requested after irreversible OTA admission; cannot undo SDK write");
         return;
     }
     ESP_LOGE(TAG, "OTA health failed: %s", reason ? reason : "Unknown");
@@ -349,6 +418,8 @@ const char *ota_health_recovery_state_str(ota_health_recovery_state_t state)
         case OTA_HEALTH_RECOVERY_REQUESTED:      return "ROLLBACK_REQUESTED";
         case OTA_HEALTH_RECOVERY_NO_FALLBACK:    return "NO_VALID_FALLBACK";
         case OTA_HEALTH_RECOVERY_ROLLBACK_ERROR: return "ROLLBACK_API_ERROR";
+        case OTA_HEALTH_RECOVERY_ROLLBACK_QUEUED: return "ROLLBACK_QUEUED";
+        case OTA_HEALTH_RECOVERY_REQUEST_TOO_LATE: return "ROLLBACK_TOO_LATE";
         default:                                return "UNKNOWN";
     }
 }
@@ -444,6 +515,8 @@ void ota_health_set_pending_verify_for_test(bool pending)
     s_seconds_in_validation = 0;
     s_rollback_handled = false;
     s_finalization_in_progress = false;
+    s_rollback_requested_during_admission = false;
+    s_mark_valid_sdk_started = false;
     s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
     s_validation_start_us = ota_health_now_us();
 }
@@ -488,6 +561,11 @@ void ota_health_set_before_final_admission_fn_for_test(ota_health_void_fn_t fn)
     s_before_final_admission_fn_for_test = fn;
 }
 
+void ota_health_set_before_sdk_handoff_fn_for_test(ota_health_void_fn_t fn)
+{
+    s_before_sdk_handoff_fn_for_test = fn;
+}
+
 void ota_health_set_mark_valid_fn_for_test(ota_mark_valid_fn_t fn)
 {
     s_mark_valid_fn_for_test = fn;
@@ -501,6 +579,8 @@ void ota_health_reset_for_test(void)
     s_validation_start_us = 0;
     s_rollback_handled = false;
     s_finalization_in_progress = false;
+    s_rollback_requested_during_admission = false;
+    s_mark_valid_sdk_started = false;
     s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
     s_rollback_detected = false;
     s_time_fn_for_test = NULL;
@@ -513,6 +593,7 @@ void ota_health_reset_for_test(void)
     s_rollback_fn_for_test = NULL;
     s_mark_valid_fn_for_test = NULL;
     s_before_final_admission_fn_for_test = NULL;
+    s_before_sdk_handoff_fn_for_test = NULL;
     s_sampled_cable_epoch = 0;
     s_sampled_rx_stream_epoch = 0;
     memset(&s_criteria, 0, sizeof(s_criteria));
