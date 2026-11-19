@@ -265,6 +265,17 @@ void z906_state_note_matched_status_reply(int64_t response_time_us);
 /** @brief Returns the last matched live STATUS reply timestamp, or 0 if invalid. */
 int64_t z906_state_get_matched_status_reply_time_us(void);
 
+/** @brief Coherent, single-state-mutex physical OTA proof snapshot. */
+typedef struct {
+    bool main_valid;
+    uint32_t cable_epoch;
+    uint32_t rx_stream_epoch;
+    int64_t matched_status_us;
+} z906_ota_status_snapshot_t;
+
+/** @brief Reads status, timestamp and both generations in one mutex operation. */
+bool z906_state_get_ota_status_snapshot(z906_ota_status_snapshot_t *out);
+
 /**
  * @brief Callback type for state change observers.
  *

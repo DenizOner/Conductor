@@ -132,6 +132,7 @@ typedef esp_err_t (*ota_mark_valid_fn_t)(void);
 
 typedef int64_t (*ota_health_time_fn_t)(void);
 typedef bool (*ota_health_bool_fn_t)(void);
+typedef void (*ota_health_void_fn_t)(void);
 
 void ota_health_set_pending_verify_for_test(bool pending);
 void ota_health_set_time_fn_for_test(ota_health_time_fn_t fn);
@@ -142,6 +143,8 @@ void ota_health_set_twdt_healthy_fn_for_test(ota_health_bool_fn_t fn);
 void ota_health_set_fallback_available_fn_for_test(ota_health_bool_fn_t fn);
 void ota_health_set_rollback_fn_for_test(ota_rollback_fn_t fn);
 void ota_health_set_mark_valid_fn_for_test(ota_mark_valid_fn_t fn);
+/** @brief Host/Unity-only interleaving hook after PASS, before final OTA admission. */
+void ota_health_set_before_final_admission_fn_for_test(ota_health_void_fn_t fn);
 void ota_health_reset_for_test(void);
 
 #ifdef __cplusplus

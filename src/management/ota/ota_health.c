@@ -46,6 +46,11 @@ static ota_health_recovery_state_t s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
 /* Short state snapshots only: SDK / NVS / OTA APIs are NEVER called under this spinlock. */
 static portMUX_TYPE s_health_mux = portMUX_INITIALIZER_UNLOCKED;
 static ota_health_bool_fn_t s_fallback_available_fn_for_test = NULL;
+/* A single coherent RX generation is sampled with the five health criteria. */
+static uint32_t s_sampled_cable_epoch = 0;
+static uint32_t s_sampled_rx_stream_epoch = 0;
+/* Test seam: inject a drop after PASS and finalization claim, before admission. */
+static ota_health_void_fn_t s_before_final_admission_fn_for_test = NULL;
 
 static int64_t ota_health_now_us(void)
 {
@@ -73,6 +78,8 @@ bool ota_health_init(void)
     s_finalization_in_progress = false;
     s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
     s_rollback_detected = false;
+    s_sampled_cable_epoch = 0;
+    s_sampled_rx_stream_epoch = 0;
     s_validation_start_us = 0;
     evaluate_criteria();
 
@@ -141,17 +148,22 @@ static void evaluate_criteria(void)
         : (zigbee_native_stack_get_state() == ZB_STACK_STATE_RUNNING &&
            zigbee_device_model_is_registered());
 
+    /* Read validity, RX generation and matched STATUS from ONE state mutex
+     * snapshot. Separate getters can span a drop and produce a mixed epoch. */
+    z906_ota_status_snapshot_t rx = { 0 };
+    bool have_rx = z906_state_get_ota_status_snapshot(&rx);
     int64_t now_us = ota_health_now_us();
     int64_t status_us = s_status_time_fn_for_test != NULL
-        ? s_status_time_fn_for_test()
-        : z906_state_get_matched_status_reply_time_us();
-    sample.z906_comm_healthy = z906_state_is_main_valid() &&
+        ? s_status_time_fn_for_test() : rx.matched_status_us;
+    sample.z906_comm_healthy = have_rx && rx.main_valid &&
         status_us > s_validation_start_us &&
         status_us <= now_us &&
         (now_us - status_us) <= OTA_Z906_STATUS_MAX_AGE_US;
 
     portENTER_CRITICAL(&s_health_mux);
     s_criteria = sample;
+    s_sampled_cable_epoch = rx.cable_epoch;
+    s_sampled_rx_stream_epoch = rx.rx_stream_epoch;
     ota_health_refresh_mask_from_criteria();
     portEXIT_CRITICAL(&s_health_mux);
 }
@@ -211,7 +223,39 @@ void ota_health_process_cycle(uint32_t elapsed_sec)
             return;
         }
 
-        ESP_LOGI(TAG, "HEALTH CHECK PASSED! All 5 subsystem criteria verified.");
+        /* A physical RX loss may preempt between the PASS snapshot and this
+         * admission boundary. Test it explicitly without any SDK flash calls
+         * under s_health_mux or the state mutex. */
+        if (s_before_final_admission_fn_for_test != NULL) {
+            s_before_final_admission_fn_for_test();
+        }
+        z906_ota_status_snapshot_t live = { 0 };
+        bool live_read = z906_state_get_ota_status_snapshot(&live);
+        int64_t admission_us = ota_health_now_us();
+        int64_t live_status_us = s_status_time_fn_for_test != NULL
+            ? s_status_time_fn_for_test() : live.matched_status_us;
+        bool z906_still_healthy = live_read && live.main_valid &&
+            live.cable_epoch == s_sampled_cable_epoch &&
+            live.rx_stream_epoch == s_sampled_rx_stream_epoch &&
+            live_status_us > s_validation_start_us &&
+            live_status_us <= admission_us &&
+            (admission_us - live_status_us) <= OTA_Z906_STATUS_MAX_AGE_US;
+        if (!z906_still_healthy) {
+            portENTER_CRITICAL(&s_health_mux);
+            s_criteria.z906_comm_healthy = false;
+            ota_health_refresh_mask_from_criteria();
+            s_finalization_in_progress = false;
+            portEXIT_CRITICAL(&s_health_mux);
+            ESP_LOGE(TAG, "Fresh STATUS proof changed after health PASS; refusing OTA approval");
+            ota_client_note_health_failure("Z906 RX generation changed before OTA approval");
+            ota_health_trigger_rollback("Z906 RX integrity lost before commit admission");
+            return;
+        }
+
+        /* Linearization point: status is admitted here, immediately before
+         * invoking the irreversible SDK mark-valid API. A loss AFTER the SDK
+         * call starts cannot retroactively cancel an otadata write. */
+        ESP_LOGI(TAG, "HEALTH CHECK PASSED! Live Z906 proof rechecked.");
         esp_err_t err = s_mark_valid_fn_for_test != NULL
             ? s_mark_valid_fn_for_test()
             : esp_ota_mark_app_valid_cancel_rollback();
@@ -439,6 +483,11 @@ void ota_health_set_rollback_fn_for_test(ota_rollback_fn_t fn)
     s_rollback_fn_for_test = fn;
 }
 
+void ota_health_set_before_final_admission_fn_for_test(ota_health_void_fn_t fn)
+{
+    s_before_final_admission_fn_for_test = fn;
+}
+
 void ota_health_set_mark_valid_fn_for_test(ota_mark_valid_fn_t fn)
 {
     s_mark_valid_fn_for_test = fn;
@@ -463,6 +512,9 @@ void ota_health_reset_for_test(void)
     s_fallback_available_fn_for_test = NULL;
     s_rollback_fn_for_test = NULL;
     s_mark_valid_fn_for_test = NULL;
+    s_before_final_admission_fn_for_test = NULL;
+    s_sampled_cable_epoch = 0;
+    s_sampled_rx_stream_epoch = 0;
     memset(&s_criteria, 0, sizeof(s_criteria));
     s_passed_criteria_mask = 0;
 }
