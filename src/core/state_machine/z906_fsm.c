@@ -37,8 +37,7 @@ static bool s_amp_resync_required = false;
  * never a delayed FSM transition from an old cable/RX epoch. */
 static z906_fsm_state_t fsm_derive_physical_state(void)
 {
-    if (s_fsm_state == FSM_STATE_UNINITIALIZED ||
-        s_fsm_state == FSM_STATE_SPEAKER_TEST) {
+    if (s_fsm_state == FSM_STATE_UNINITIALIZED) {
         return s_fsm_state;
     }
     z906_ota_status_snapshot_t ready = { 0 };
@@ -49,6 +48,9 @@ static z906_fsm_state_t fsm_derive_physical_state(void)
     z906_state_get(&physical);
     if (!physical.cable_connected || !physical.main_state_valid) {
         return FSM_STATE_FAULT; /* No verified amplifier state. */
+    }
+    if (s_fsm_state == FSM_STATE_SPEAKER_TEST && physical.power) {
+        return FSM_STATE_SPEAKER_TEST;
     }
     if (!physical.power) {
         return FSM_STATE_STANDBY;
@@ -72,7 +74,8 @@ static void fsm_set_state(z906_fsm_state_t new_state)
         /* If a higher-priority RX loss invalidated proof during this log,
          * don't publish an obsolete transition. State observers operate
          * separately on coherent physical state, not on this event's cache. */
-        if (fsm_derive_physical_state() == new_state) {
+        if (new_state == FSM_STATE_BOOTING ||
+            fsm_derive_physical_state() == new_state) {
             z906_event_t evt = { .type = EVENT_STATE_CHANGED };
             event_bus_post(&evt, 0);
         }
