@@ -107,7 +107,7 @@ typedef enum {
 } z906_effect_t;
 #include "z906_commands.h"
 typedef struct {
-    bool cable_connected, power, mute, auto_standby_enabled, temp_valid;
+    bool cable_connected, power, mute, auto_standby_enabled, temp_valid, main_state_valid;
     uint8_t volume, volume_bass, volume_center, volume_rear;
     uint8_t digital_signal_status;
     z906_input_t input;
@@ -115,7 +115,13 @@ typedef struct {
     int8_t temp_celsius[3];
     uint32_t idle_seconds, input_signal_level;
 } z906_state_t;
+typedef struct {
+    bool main_valid;
+    uint32_t cable_epoch, rx_stream_epoch;
+    int64_t matched_status_us;
+} z906_ota_status_snapshot_t;
 void z906_state_get(z906_state_t *);
+bool z906_state_get_ota_status_snapshot(z906_ota_status_snapshot_t *);
 uint32_t z906_state_get_cable_epoch(void);
 bool z906_state_confirm_main_for_epoch(uint32_t);
 bool z906_state_apply_verified_config_for_epoch(uint32_t, uint32_t,
@@ -162,6 +168,7 @@ static uint32_t s_stream = 0;
 static unsigned s_confirmed, s_ota_replies, s_forwarded;
 static unsigned s_invalidations, s_input_updates;
 static bool s_switch_during_console_write;
+static bool s_drop_after_config_commit, s_drop_after_echo_commit;
 static unsigned s_interleave_after_console_bytes;
 
 static const uint8_t s_payload[20] = {
@@ -191,6 +198,19 @@ uint32_t z906_state_note_amp_rx_loss(uint32_t cable) {
     return ++s_stream;
 }
 void z906_state_get(z906_state_t *out) { *out = s_state; }
+bool z906_state_get_ota_status_snapshot(z906_ota_status_snapshot_t *out) {
+    if (out == NULL) return false;
+    out->main_valid = s_state.cable_connected && s_state.main_state_valid;
+    out->cable_epoch = s_epoch;
+    out->rx_stream_epoch = s_stream;
+    out->matched_status_us = out->main_valid ? 1000000 : 0;
+    return true;
+}
+static void drop_rx_after_state_commit(void) {
+    ++s_epoch;
+    ++s_stream;
+    s_state.main_state_valid = false;
+}
 void z906_state_set_main_valid(bool valid) {
     assert(!valid); ++s_invalidations;
 }
@@ -208,6 +228,12 @@ bool z906_state_apply_verified_config_for_epoch(uint32_t e, uint32_t rx,
     s_state.volume = cfg->volume;
     s_state.input = cfg->input;
     s_state.power = cfg->power;
+    s_state.mute = cfg->mute;
+    s_state.main_state_valid = true;
+    if (s_drop_after_config_commit) {
+        s_drop_after_config_commit = false;
+        drop_rx_after_state_commit();
+    }
     return true;
 }
 bool z906_state_apply_amp_echo_for_generations(uint32_t cable, uint32_t rx,
@@ -216,13 +242,18 @@ bool z906_state_apply_amp_echo_for_generations(uint32_t cable, uint32_t rx,
         return false;
     }
     switch (cmd) {
-        case 0x36: s_state.power = false; return true;
-        case 0x20: s_state.mute = true; return true;
-        case 0x21: s_state.mute = false; return true;
-        case 0x08: ++s_state.volume; return true;
-        case 0x03: s_state.input = Z906_INPUT_OPTICAL_1; ++s_input_updates; return true;
+        case 0x36: s_state.power = false; break;
+        case 0x20: s_state.mute = true; break;
+        case 0x21: s_state.mute = false; break;
+        case 0x08: ++s_state.volume; break;
+        case 0x03: s_state.input = Z906_INPUT_OPTICAL_1; ++s_input_updates; break;
         default: return false;
     }
+    if (s_drop_after_echo_commit) {
+        s_drop_after_echo_commit = false;
+        drop_rx_after_state_commit();
+    }
+    return true;
 }
 void z906_state_set_volume(uint8_t v) { s_state.volume = v; }
 void z906_state_set_trim(uint8_t i, uint8_t v) {
@@ -419,7 +450,31 @@ int main(void) {
             assert(s_state.input_signal_level == 801);
         }
     }
-    puts("PASS: FSM+codec cable loss, orphan RX, atomic multi-byte telemetry");
+    /* J-03: inject physical loss AFTER the store accepted a CONFIG or
+     * one-byte echo, but BEFORE the FSM transition / state-change event. */
+    s_drop_after_config_commit = true;
+    push_config(0, 24, s_epoch, s_stream);
+    drain_all();
+    assert(!s_state.main_state_valid);
+    assert(z906_fsm_get_state() == FSM_STATE_FAULT);
+    push_config(0, 24, s_epoch, s_stream);
+    drain_all();
+    assert(s_state.main_state_valid);
+    assert(z906_fsm_get_state() == FSM_STATE_ACTIVE ||
+           z906_fsm_get_state() == FSM_STATE_MUTED ||
+           z906_fsm_get_state() == FSM_STATE_STANDBY);
+
+    s_drop_after_echo_commit = true;
+    push_amp(0x20, s_epoch, s_stream);
+    drain_all();
+    assert(!s_state.main_state_valid);
+    assert(z906_fsm_get_state() == FSM_STATE_FAULT);
+    push_config(0, 24, s_epoch, s_stream);
+    drain_all();
+    assert(s_state.main_state_valid);
+    assert(z906_fsm_get_state() != FSM_STATE_FAULT);
+
+    puts("PASS: FSM+codec atomic telemetry and physical-state diagnostics across delayed transitions");
 }
 """
 
