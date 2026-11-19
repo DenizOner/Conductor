@@ -20,6 +20,7 @@
 
 static int s_rollback_call_count = 0;
 static int s_mark_valid_call_count = 0;
+static bool s_inject_rollback_during_sdk_call = false;
 static const char *s_last_rollback_reason = NULL;
 static int64_t s_fake_time_us = 1000000;
 static bool s_fake_zigbee_ready = true;
@@ -57,6 +58,9 @@ static void mock_rollback_fn(const char *reason)
 static esp_err_t mock_mark_valid_ok(void)
 {
     ++s_mark_valid_call_count;
+    if (s_inject_rollback_during_sdk_call) {
+        ota_health_trigger_rollback("Concurrent CLI rollback inside SDK stub");
+    }
     return ESP_OK;
 }
 
@@ -65,6 +69,10 @@ static void inject_rx_drop_at_final_admission(void)
     uint32_t cable = z906_state_get_cable_epoch();
     (void)z906_state_note_amp_rx_loss(cable);
     s_fake_status_time_us = 0;
+}
+static void request_rollback_at_sdk_handoff(void)
+{
+    ota_health_trigger_rollback("CLI rollback before SDK admission");
 }
 
 void setUp(void)
@@ -92,6 +100,7 @@ void setUp(void)
     ota_health_set_fallback_available_fn_for_test(mock_fallback_available);
     s_rollback_call_count = 0;
     s_mark_valid_call_count = 0;
+    s_inject_rollback_during_sdk_call = false;
     s_last_rollback_reason = NULL;
 }
 
@@ -537,6 +546,51 @@ void test_ota_final_admission_loss_without_fallback_remains_pending(void)
                       ota_health_get_recovery_state());
 }
 
+/** @brief The second SDK handoff guard must reject RX loss after PASS. */
+void test_ota_rx_loss_after_final_proof_before_sdk_handoff(void)
+{
+    ota_health_set_rollback_fn_for_test(mock_rollback_fn);
+    ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
+    ota_health_set_pending_verify_for_test(true);
+    ota_health_set_before_sdk_handoff_fn_for_test(inject_rx_drop_at_final_admission);
+    s_auto_status_refresh = true;
+    for (int i = 0; i < 15; ++i) advance_health_second();
+    TEST_ASSERT_EQUAL_INT(0, s_mark_valid_call_count);
+    TEST_ASSERT_EQUAL_INT(1, s_rollback_call_count);
+    TEST_ASSERT_FALSE(ota_health_is_validated());
+}
+
+/** @brief A concurrent manual rollback before SDK claim must cancel VALID. */
+void test_ota_queued_rollback_wins_over_pending_commit(void)
+{
+    ota_health_set_rollback_fn_for_test(mock_rollback_fn);
+    ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
+    ota_health_set_pending_verify_for_test(true);
+    ota_health_set_before_sdk_handoff_fn_for_test(request_rollback_at_sdk_handoff);
+    s_auto_status_refresh = true;
+    for (int i = 0; i < 15; ++i) advance_health_second();
+    TEST_ASSERT_EQUAL_INT(0, s_mark_valid_call_count);
+    TEST_ASSERT_EQUAL_INT(1, s_rollback_call_count);
+    TEST_ASSERT_EQUAL(OTA_HEALTH_RECOVERY_REQUESTED,
+                      ota_health_get_recovery_state());
+}
+
+/** @brief A rollback during the irreversible API cannot be falsely reported. */
+void test_ota_rollback_during_sdk_is_reported_too_late(void)
+{
+    ota_health_set_rollback_fn_for_test(mock_rollback_fn);
+    ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
+    ota_health_set_pending_verify_for_test(true);
+    s_inject_rollback_during_sdk_call = true;
+    s_auto_status_refresh = true;
+    for (int i = 0; i < 15; ++i) advance_health_second();
+    TEST_ASSERT_EQUAL_INT(1, s_mark_valid_call_count);
+    TEST_ASSERT_EQUAL_INT(0, s_rollback_call_count);
+    TEST_ASSERT_TRUE(ota_health_is_validated());
+    TEST_ASSERT_EQUAL(OTA_HEALTH_RECOVERY_REQUEST_TOO_LATE,
+                      ota_health_get_recovery_state());
+}
+
 int runUnityTests(void)
 {
     UNITY_BEGIN();
@@ -563,6 +617,9 @@ int runUnityTests(void)
     RUN_TEST(test_ota_watchdog_owner_failure_rejects_image);
     RUN_TEST(test_ota_rx_loss_between_pass_and_final_admission_rejects_commit);
     RUN_TEST(test_ota_final_admission_loss_without_fallback_remains_pending);
+    RUN_TEST(test_ota_rx_loss_after_final_proof_before_sdk_handoff);
+    RUN_TEST(test_ota_queued_rollback_wins_over_pending_commit);
+    RUN_TEST(test_ota_rollback_during_sdk_is_reported_too_late);
     return UNITY_END();
 }
 
