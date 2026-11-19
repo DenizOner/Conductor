@@ -117,6 +117,7 @@ HARNESS = r"""
 #include "ota_health.h"
 #include "esp_ota_ops.h"
 #include "zigbee_native_stack.h"
+#include "z906_state.h"
 
 static int64_t s_now = 1000000;
 static bool s_z906_ok;
