@@ -345,7 +345,8 @@ static void cable_notice(bool connected) {
 }
 int main(void) {
     assert(z906_fsm_init());
-    drain_all(); /* Initial state change from FSM init. */
+    assert(s_write > s_read && s_events[s_read].type == EVENT_STATE_CHANGED);
+    drain_all(); /* Preserve the original BOOTING state notification. */
 
     /* Start a valid frame, then lose both cable change events. */
     push_config(0, 10, 1, 0);

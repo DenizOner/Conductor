@@ -44,7 +44,7 @@ static bool s_telemetry_twdt_feed_ok = false;
 static bool s_finalization_in_progress = false;
 /* Rollback requests during a cancellable admission must never disappear. */
 static bool s_rollback_requested_during_admission = false;
-static bool s_mark_valid_sdk_started = false;
+static bool s_commit_admitted = false;
 static ota_health_recovery_state_t s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
 /* Short state snapshots only: SDK / NVS / OTA APIs are NEVER called under this spinlock. */
 static portMUX_TYPE s_health_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -82,7 +82,7 @@ bool ota_health_init(void)
     s_rollback_handled = false;
     s_finalization_in_progress = false;
     s_rollback_requested_during_admission = false;
-    s_mark_valid_sdk_started = false;
+    s_commit_admitted = false;
     s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
     s_rollback_detected = false;
     s_sampled_cable_epoch = 0;
@@ -224,7 +224,7 @@ void ota_health_process_cycle(uint32_t elapsed_sec)
                        !s_rollback_handled && !s_finalization_in_progress;
         if (claimed) {
             s_finalization_in_progress = true;
-            s_mark_valid_sdk_started = false;
+            s_commit_admitted = false;
             s_rollback_requested_during_admission = false;
         }
         portEXIT_CRITICAL(&s_health_mux);
@@ -288,7 +288,7 @@ void ota_health_process_cycle(uint32_t elapsed_sec)
             s_criteria.z906_comm_healthy = false;
             ota_health_refresh_mask_from_criteria();
         } else {
-            s_mark_valid_sdk_started = true;
+            s_commit_admitted = true;
         }
         portEXIT_CRITICAL(&s_health_mux);
         if (cancel_commit) {
@@ -310,7 +310,7 @@ void ota_health_process_cycle(uint32_t elapsed_sec)
         }
         bool too_late_rollback = s_recovery_state == OTA_HEALTH_RECOVERY_REQUEST_TOO_LATE;
         s_finalization_in_progress = false;
-        s_mark_valid_sdk_started = false;
+        s_commit_admitted = false;
         s_rollback_requested_during_admission = false;
         portEXIT_CRITICAL(&s_health_mux);
         if (too_late_rollback) {
@@ -345,7 +345,7 @@ void ota_health_trigger_rollback(const char *reason)
     bool queued = false;
     bool too_late = false;
     if (!already_handled && s_finalization_in_progress) {
-        if (!s_mark_valid_sdk_started) {
+        if (!s_commit_admitted) {
             s_rollback_requested_during_admission = true;
             s_recovery_state = OTA_HEALTH_RECOVERY_ROLLBACK_QUEUED;
             queued = true;
@@ -516,7 +516,7 @@ void ota_health_set_pending_verify_for_test(bool pending)
     s_rollback_handled = false;
     s_finalization_in_progress = false;
     s_rollback_requested_during_admission = false;
-    s_mark_valid_sdk_started = false;
+    s_commit_admitted = false;
     s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
     s_validation_start_us = ota_health_now_us();
 }
@@ -580,7 +580,7 @@ void ota_health_reset_for_test(void)
     s_rollback_handled = false;
     s_finalization_in_progress = false;
     s_rollback_requested_during_admission = false;
-    s_mark_valid_sdk_started = false;
+    s_commit_admitted = false;
     s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
     s_rollback_detected = false;
     s_time_fn_for_test = NULL;
