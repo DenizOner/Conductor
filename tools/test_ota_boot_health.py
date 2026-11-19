@@ -127,6 +127,7 @@ static bool s_zigbee_ok;
 static bool s_fallback_ok;
 static esp_err_t s_rollback_result = ESP_OK;
 static int s_valid_count;
+static bool s_inject_rollback_while_sdk_runs;
 static int s_rollback_count;
 static int s_failure_count;
 static esp_partition_t s_running = { "ota_0" };
@@ -162,7 +163,13 @@ esp_err_t esp_ota_get_state_partition(const esp_partition_t *p, esp_ota_img_stat
     (void)p; *state = ESP_OTA_IMG_PENDING_VERIFY; return ESP_OK;
 }
 bool esp_ota_check_rollback_is_possible(void) { return s_fallback_ok; }
-esp_err_t esp_ota_mark_app_valid_cancel_rollback(void) { ++s_valid_count; return ESP_OK; }
+esp_err_t esp_ota_mark_app_valid_cancel_rollback(void) {
+    ++s_valid_count;
+    if (s_inject_rollback_while_sdk_runs) {
+        ota_health_trigger_rollback("Manual rollback during SDK commit");
+    }
+    return ESP_OK;
+}
 esp_err_t esp_ota_mark_app_invalid_rollback_and_reboot(void) { ++s_rollback_count; return s_rollback_result; }
 void esp_restart(void) { assert(!"unexpected forced reboot"); }
 
@@ -177,6 +184,7 @@ static void reset_case(void) {
     s_fallback_ok = true;
     s_rollback_result = ESP_OK;
     s_valid_count = 0;
+    s_inject_rollback_while_sdk_runs = false;
     s_rollback_count = 0;
     s_failure_count = 0;
     assert(ota_health_init());
@@ -200,6 +208,13 @@ static void drop_after_pass_before_mark_valid(void) {
 static void change_epoch_after_pass(void) {
     /* Even a stale unchanged status timestamp cannot cross generations. */
     ++s_rx_epoch;
+}
+static void manual_rollback_during_admission(void) {
+    ota_health_trigger_rollback("Manual CLI rollback while final proof is checked");
+}
+static void rx_drop_between_proof_and_sdk_handoff(void) {
+    /* Preemption after first snapshot, before the final SDK claim. */
+    drop_after_pass_before_mark_valid();
 }
 int main(void) {
     /* 15 s with no verified amplifier frame must roll back. */
@@ -281,6 +296,45 @@ int main(void) {
     assert(s_valid_count == 0 && s_rollback_count == 0);
     assert(ota_health_get_recovery_state() == OTA_HEALTH_RECOVERY_NO_FALLBACK);
 
+    /* I-01: preempt AFTER the first successful proof check; the final
+     * handoff guard must reject before the irreversible SDK call. */
+    reset_case();
+    advance(11);
+    report_verified_status();
+    ota_health_set_before_sdk_handoff_fn_for_test(rx_drop_between_proof_and_sdk_handoff);
+    advance(4);
+    assert(s_valid_count == 0 && s_rollback_count == 1 && !ota_health_is_validated());
+
+    /* I-02: manual rollback during the cancellable admission is latched and
+     * wins; no marked-valid call and exactly one rollback action. */
+    reset_case();
+    advance(11);
+    report_verified_status();
+    ota_health_set_before_sdk_handoff_fn_for_test(manual_rollback_during_admission);
+    advance(4);
+    assert(s_valid_count == 0 && s_rollback_count == 1);
+    assert(ota_health_get_recovery_state() == OTA_HEALTH_RECOVERY_REQUESTED);
+
+    /* I-02 no-fallback: queued manual rollback never forces a reboot. */
+    reset_case();
+    s_fallback_ok = false;
+    advance(11);
+    report_verified_status();
+    ota_health_set_before_sdk_handoff_fn_for_test(manual_rollback_during_admission);
+    advance(4);
+    assert(s_valid_count == 0 && s_rollback_count == 0);
+    assert(ota_health_get_recovery_state() == OTA_HEALTH_RECOVERY_NO_FALLBACK);
+
+    /* I-02 after SDK entry: rollback request is diagnosed TOO_LATE, never
+     * silently ignored, and a second irreversible OTA call does not race. */
+    reset_case();
+    advance(11);
+    report_verified_status();
+    s_inject_rollback_while_sdk_runs = true;
+    advance(4);
+    assert(s_valid_count == 1 && s_rollback_count == 0 && ota_health_is_validated());
+    assert(ota_health_get_recovery_state() == OTA_HEALTH_RECOVERY_REQUEST_TOO_LATE);
+
     /* No fallback image: no forced restart, no false validation or repeat abort. */
     reset_case();
     s_fallback_ok = false;
@@ -327,7 +381,7 @@ int main(void) {
     advance(15);
     assert(s_valid_count == 0 && s_rollback_count == 1);
 
-    puts("PASS: OTA runtime health C host harness (15 scenarios)");
+    puts("PASS: OTA runtime health C host harness (19 scenarios)");
     return 0;
 }
 """
