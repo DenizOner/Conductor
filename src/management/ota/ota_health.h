@@ -29,7 +29,9 @@ typedef enum {
     OTA_HEALTH_RECOVERY_NONE = 0,
     OTA_HEALTH_RECOVERY_REQUESTED,
     OTA_HEALTH_RECOVERY_NO_FALLBACK,
-    OTA_HEALTH_RECOVERY_ROLLBACK_ERROR
+    OTA_HEALTH_RECOVERY_ROLLBACK_ERROR,
+    OTA_HEALTH_RECOVERY_ROLLBACK_QUEUED,
+    OTA_HEALTH_RECOVERY_REQUEST_TOO_LATE
 } ota_health_recovery_state_t;
 
 #define OTA_CRITERION_SCHEDULER   (1u << 0)
@@ -145,6 +147,8 @@ void ota_health_set_rollback_fn_for_test(ota_rollback_fn_t fn);
 void ota_health_set_mark_valid_fn_for_test(ota_mark_valid_fn_t fn);
 /** @brief Host/Unity-only interleaving hook after PASS, before final OTA admission. */
 void ota_health_set_before_final_admission_fn_for_test(ota_health_void_fn_t fn);
+/** @brief Test interleaving after final proof but before SDK handoff claim. */
+void ota_health_set_before_sdk_handoff_fn_for_test(ota_health_void_fn_t fn);
 void ota_health_reset_for_test(void);
 
 #ifdef __cplusplus

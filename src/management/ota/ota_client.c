@@ -29,7 +29,8 @@ static const esp_partition_t *s_target_partition  = NULL;
 static void ota_client_sync_state_from_health(void)
 {
     ota_health_recovery_state_t recovery = ota_health_get_recovery_state();
-    if (recovery != OTA_HEALTH_RECOVERY_NONE) {
+    if (recovery != OTA_HEALTH_RECOVERY_NONE &&
+        recovery != OTA_HEALTH_RECOVERY_REQUEST_TOO_LATE) {
         /* Pending image is NOT a healthy pending download once validation
          * failed. Do not overwrite FAILED with PENDING_VALIDATION. */
         s_state = OTA_STATE_FAILED;

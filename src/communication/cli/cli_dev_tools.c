@@ -86,6 +86,10 @@ static void cmd_dev_ota_status(void)
     if (recovery == OTA_HEALTH_RECOVERY_NO_FALLBACK ||
         recovery == OTA_HEALTH_RECOVERY_ROLLBACK_ERROR) {
         printf("WARNING: OTA image is unconfirmed; manual recovery decision required.\n");
+    } else if (recovery == OTA_HEALTH_RECOVERY_ROLLBACK_QUEUED) {
+        printf("WARNING: Rollback queued; firmware validation will abort before SDK commit.\n");
+    } else if (recovery == OTA_HEALTH_RECOVERY_REQUEST_TOO_LATE) {
+        printf("WARNING: Rollback requested after software OTA admission; in-flight SDK commit cannot be undone.\n");
     }
     printf("Rollback Possible:   %s\n", diag.is_rollback_possible ? "YES" : "NO");
     printf("Previous Rollback:   %s\n", ota_health_was_rollback_detected() ? "DETECTED ON BOOT" : "NONE");
@@ -388,8 +392,10 @@ void cli_dev_tools_process(char *subcmd)
             printf("[SUCCESS] Query Next Image Request dispatched to coordinator.\n");
         }
     } else if (strcmp(subcmd, "ota_rollback") == 0) {
-        printf("[WARNING] Initiating manual firmware rollback to alternate partition slot...\n");
+        printf("[WARNING] Requesting manual rollback (may be queued during OTA admission)...\n");
         ota_health_trigger_rollback("Manual CLI rollback request");
+        printf("[INFO] Rollback request state: %s\n",
+               ota_health_recovery_state_str(ota_health_get_recovery_state()));
     } else if (strcmp(subcmd, "wdt_status") == 0) {
         debug_console_print_wdt_status();
     } else if (strcmp(subcmd, "debug_status") == 0) {
