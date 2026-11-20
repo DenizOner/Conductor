@@ -53,8 +53,11 @@ static void ota_client_sync_state_from_health(void)
         return;
     }
 
-    if (s_state == OTA_STATE_PENDING_VALIDATION) {
+    if (s_state == OTA_STATE_PENDING_VALIDATION && ota_health_is_validated()) {
+        /* A cleared pending flag alone is not proof of a committed image.
+         * Publish SUCCESS only after OTA health confirms SDK mark-valid. */
         s_state = OTA_STATE_SUCCESS;
+        s_last_result = OTA_RESULT_SUCCESS;
     } else if (ota_health_was_rollback_detected() && s_state == OTA_STATE_IDLE) {
         s_state = OTA_STATE_ROLLBACK;
     }

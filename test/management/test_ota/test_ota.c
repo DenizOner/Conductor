@@ -140,6 +140,27 @@ void tearDown(void)
     zigbee_app_reset_state();
 }
 
+/** @brief Fresh pending boot reports SUCCESS only after verified SDK approval. */
+void test_ota_fresh_pending_boot_success_records_last_result(void)
+{
+    TEST_ASSERT_EQUAL(OTA_STATE_IDLE, ota_client_get_state());
+    TEST_ASSERT_EQUAL(OTA_RESULT_NONE, ota_client_get_last_result());
+    ota_health_set_rollback_fn_for_test(mock_rollback_fn);
+    ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
+    ota_health_set_pending_verify_for_test(true);
+    prime_ota_client_pending_validation();
+    s_auto_status_refresh = true;
+    for (int i = 0; i < 15; ++i) advance_health_second();
+    ota_client_process_cycle();
+
+    TEST_ASSERT_EQUAL_INT(1, s_mark_valid_call_count);
+    TEST_ASSERT_EQUAL_INT(0, s_rollback_call_count);
+    TEST_ASSERT_TRUE(ota_health_is_validated());
+    TEST_ASSERT_EQUAL(OTA_STATE_SUCCESS, ota_client_get_state());
+    TEST_ASSERT_EQUAL(OTA_RESULT_SUCCESS, ota_client_get_last_result());
+    ota_client_abort("Reset client state after fresh boot success test");
+}
+
 /**
  * @brief Tests OTA client state machine string conversion.
  */
@@ -836,11 +857,29 @@ void test_ota_sdk_commit_failure_late_manual_without_fallback(void)
     TEST_ASSERT_EQUAL(OTA_STATE_FAILED, ota_client_get_state());
 }
 
+/** @brief A cleared pending flag without SDK approval must never announce SUCCESS. */
+void test_ota_unconfirmed_pending_clear_cannot_report_success(void)
+{
+    ota_client_note_health_failure("Prior OTA failure");
+    TEST_ASSERT_EQUAL(OTA_RESULT_HEALTH_CHECK_FAILED, ota_client_get_last_result());
+    ota_health_set_pending_verify_for_test(true);
+    prime_ota_client_pending_validation();
+    ota_health_set_pending_verify_for_test(false); /* Corrupt/cleared pending flag; not SDK approval. */
+    ota_client_process_cycle();
+
+    TEST_ASSERT_FALSE(ota_health_is_validated());
+    TEST_ASSERT_EQUAL(OTA_STATE_PENDING_VALIDATION, ota_client_get_state());
+    TEST_ASSERT_EQUAL(OTA_RESULT_HEALTH_CHECK_FAILED, ota_client_get_last_result());
+    ota_client_abort("Reset client state after unconfirmed pending test");
+}
+
 /** @brief A successful SDK commit stays valid despite a too-late CLI request. */
 void test_ota_sdk_commit_success_preserves_too_late_diagnostic(void)
 {
     ota_health_set_rollback_fn_for_test(mock_rollback_fn);
     ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
+    ota_client_note_health_failure("Previous OTA error must not survive successful validation");
+    TEST_ASSERT_EQUAL(OTA_RESULT_HEALTH_CHECK_FAILED, ota_client_get_last_result());
     ota_health_set_pending_verify_for_test(true);
     prime_ota_client_pending_validation();
     s_inject_rollback_during_sdk_call = true;
@@ -852,14 +891,19 @@ void test_ota_sdk_commit_success_preserves_too_late_diagnostic(void)
     TEST_ASSERT_FALSE(ota_health_was_sdk_mark_valid_failed());
     TEST_ASSERT_EQUAL(OTA_HEALTH_RECOVERY_REQUEST_TOO_LATE, ota_health_get_recovery_state());
     TEST_ASSERT_EQUAL(OTA_STATE_SUCCESS, ota_client_get_state());
+    TEST_ASSERT_EQUAL(OTA_RESULT_SUCCESS, ota_client_get_last_result());
     TEST_ASSERT_EQUAL_INT(0, s_rollback_call_count);
-    /* The current client only updates last_result on failure; testing a
-     * fresh SUCCESS result needs an explicit production-client contract. */
+    ota_diagnostics_t diag = {0};
+    ota_client_get_diagnostics(&diag);
+    TEST_ASSERT_EQUAL(OTA_STATE_SUCCESS, diag.current_state);
+    TEST_ASSERT_EQUAL(OTA_RESULT_SUCCESS, diag.last_result);
 }
 
 int runUnityTests(void)
 {
     UNITY_BEGIN();
+    /* Must run first to verify fresh-process static OTA result defaults. */
+    RUN_TEST(test_ota_fresh_pending_boot_success_records_last_result);
     RUN_TEST(test_ota_state_strings);
     RUN_TEST(test_ota_result_strings);
     RUN_TEST(test_ota_incompatible_image_rejection);
@@ -897,6 +941,7 @@ int runUnityTests(void)
     RUN_TEST(test_ota_concurrent_manual_and_real_rx_failure_reports_health_failure);
     RUN_TEST(test_ota_sdk_commit_failure_overrides_late_manual_with_fallback);
     RUN_TEST(test_ota_sdk_commit_failure_late_manual_without_fallback);
+    RUN_TEST(test_ota_unconfirmed_pending_clear_cannot_report_success);
     RUN_TEST(test_ota_sdk_commit_success_preserves_too_late_diagnostic);
     return UNITY_END();
 }
