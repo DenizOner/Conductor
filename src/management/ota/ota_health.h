@@ -70,6 +70,12 @@ bool ota_health_is_pending_verify(void);
  */
 void ota_health_trigger_rollback(const char *reason);
 
+/** @brief CLI operator rollback: records request provenance without changing health proof. */
+void ota_health_trigger_manual_rollback(const char *reason);
+
+/** @brief True only for operator recovery without a recorded failed health criterion. */
+bool ota_health_was_manual_only_rollback(void);
+
 /** @brief Read-only recovery diagnostic (does not initiate any recovery). */
 ota_health_recovery_state_t ota_health_get_recovery_state(void);
 const char *ota_health_recovery_state_str(ota_health_recovery_state_t state);

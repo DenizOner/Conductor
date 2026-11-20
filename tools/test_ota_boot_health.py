@@ -174,7 +174,7 @@ bool esp_ota_check_rollback_is_possible(void) { return s_fallback_ok; }
 esp_err_t esp_ota_mark_app_valid_cancel_rollback(void) {
     ++s_valid_count;
     if (s_inject_rollback_while_sdk_runs) {
-        ota_health_trigger_rollback("Manual rollback during SDK commit");
+        ota_health_trigger_manual_rollback("Manual rollback during SDK commit");
     }
     return ESP_OK;
 }
@@ -218,14 +218,14 @@ static void change_epoch_after_pass(void) {
     ++s_rx_epoch;
 }
 static void manual_rollback_during_admission(void) {
-    ota_health_trigger_rollback("Manual CLI rollback while final proof is checked");
+    ota_health_trigger_manual_rollback("Manual CLI rollback while final proof is checked");
 }
 static void rx_drop_between_proof_and_sdk_handoff(void) {
     /* Preemption after first snapshot, before the final SDK claim. */
     drop_after_pass_before_mark_valid();
 }
 static void rollback_after_atomic_software_admission(void) {
-    ota_health_trigger_rollback("Manual request after atomic admission, before SDK entry");
+    ota_health_trigger_manual_rollback("Manual request after atomic admission, before SDK entry");
 }
 int main(void) {
     /* 15 s with no verified amplifier frame must roll back. */
@@ -330,6 +330,7 @@ int main(void) {
     assert(manual_only_criteria.z906_comm_healthy);
     assert((ota_health_get_passed_criteria_mask() & OTA_CRITERION_Z906_COMM) != 0);
     assert(s_failure_count == 0); /* User request is not a health-check failure. */
+    assert(ota_health_was_manual_only_rollback());
 
     /* I-02 no-fallback: queued manual rollback never forces a reboot. */
     reset_case();
@@ -342,6 +343,7 @@ int main(void) {
     assert(ota_health_get_recovery_state() == OTA_HEALTH_RECOVERY_NO_FALLBACK);
     ota_health_get_criteria(&manual_only_criteria);
     assert(manual_only_criteria.z906_comm_healthy && s_failure_count == 0);
+    assert(ota_health_was_manual_only_rollback());
 
     /* 19-K: RX drop precisely after a previous snapshot, before atomic claim. */
     reset_case();
@@ -364,6 +366,7 @@ int main(void) {
     ota_health_get_criteria(&manual_only_criteria);
     assert(manual_only_criteria.z906_comm_healthy);
     assert((ota_health_get_passed_criteria_mask() & OTA_CRITERION_Z906_COMM) != 0);
+    assert(ota_health_was_manual_only_rollback());
 
     /* 19-K option A: loss AFTER the atomic claim cannot retroactively veto SDK. */
     reset_case();
@@ -438,7 +441,7 @@ int main(void) {
     advance(15);
     assert(s_valid_count == 0 && s_rollback_count == 1);
 
-    puts("PASS: OTA runtime health C host harness (19 scenarios)");
+    puts("PASS: OTA runtime health C host harness (23 scenarios)");
     return 0;
 }
 """

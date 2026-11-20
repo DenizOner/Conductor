@@ -59,7 +59,7 @@ static esp_err_t mock_mark_valid_ok(void)
 {
     ++s_mark_valid_call_count;
     if (s_inject_rollback_during_sdk_call) {
-        ota_health_trigger_rollback("Concurrent CLI rollback inside SDK stub");
+        ota_health_trigger_manual_rollback("Concurrent CLI rollback inside SDK stub");
     }
     return ESP_OK;
 }
@@ -72,11 +72,11 @@ static void inject_rx_drop_at_final_admission(void)
 }
 static void request_rollback_at_sdk_handoff(void)
 {
-    ota_health_trigger_rollback("CLI rollback before SDK admission");
+    ota_health_trigger_manual_rollback("CLI rollback before SDK admission");
 }
 static void request_rollback_after_atomic_claim(void)
 {
-    ota_health_trigger_rollback("CLI rollback after software claim before SDK entry");
+    ota_health_trigger_manual_rollback("CLI rollback after software claim before SDK entry");
 }
 
 void setUp(void)
@@ -144,6 +144,7 @@ void test_ota_result_strings(void)
     TEST_ASSERT_EQUAL_STRING("FLASH_FAILED", ota_client_result_str(OTA_RESULT_FLASH_FAILED));
     TEST_ASSERT_EQUAL_STRING("HEALTH_CHECK_FAILED", ota_client_result_str(OTA_RESULT_HEALTH_CHECK_FAILED));
     TEST_ASSERT_EQUAL_STRING("ROLLBACK_DETECTED", ota_client_result_str(OTA_RESULT_ROLLBACK_DETECTED));
+    TEST_ASSERT_EQUAL_STRING("MANUAL_ROLLBACK_REQUESTED", ota_client_result_str(OTA_RESULT_MANUAL_ROLLBACK_REQUESTED));
 }
 
 /**
@@ -581,6 +582,7 @@ void test_ota_queued_rollback_wins_over_pending_commit(void)
     ota_health_get_criteria(&criteria);
     TEST_ASSERT_TRUE(criteria.z906_comm_healthy);
     TEST_ASSERT_TRUE(ota_health_get_passed_criteria_mask() & OTA_CRITERION_Z906_COMM);
+    TEST_ASSERT_TRUE(ota_health_was_manual_only_rollback());
 }
 
 /** @brief 19-K: the former final snapshot-to-claim gap must fail closed. */
@@ -615,6 +617,7 @@ void test_ota_atomic_admission_manual_veto_keeps_healthy_z906(void)
     ota_health_get_criteria(&criteria);
     TEST_ASSERT_TRUE(criteria.z906_comm_healthy);
     TEST_ASSERT_TRUE(ota_health_get_passed_criteria_mask() & OTA_CRITERION_Z906_COMM);
+    TEST_ASSERT_TRUE(ota_health_was_manual_only_rollback());
 }
 
 /** @brief 19-K option A: later physical loss does not undo software admission. */
@@ -644,6 +647,19 @@ void test_ota_manual_rollback_after_atomic_claim_is_too_late(void)
     TEST_ASSERT_EQUAL_INT(0, s_rollback_call_count);
     TEST_ASSERT_EQUAL(OTA_HEALTH_RECOVERY_REQUEST_TOO_LATE,
                       ota_health_get_recovery_state());
+}
+
+/** @brief Operator-only rollback is never reported as failed Z906 health. */
+void test_ota_manual_rollback_result_is_distinct_from_health_failure(void)
+{
+    ota_health_set_rollback_fn_for_test(mock_rollback_fn);
+    ota_health_set_pending_verify_for_test(true);
+    ota_health_trigger_manual_rollback("Operator cancelled pending OTA");
+    ota_client_process_cycle();
+    TEST_ASSERT_TRUE(ota_health_was_manual_only_rollback());
+    TEST_ASSERT_EQUAL(OTA_RESULT_MANUAL_ROLLBACK_REQUESTED, ota_client_get_last_result());
+    TEST_ASSERT_EQUAL(OTA_STATE_FAILED, ota_client_get_state());
+    TEST_ASSERT_EQUAL_INT(1, s_rollback_call_count);
 }
 
 /** @brief A rollback during the irreversible API cannot be falsely reported. */
@@ -694,6 +710,7 @@ int runUnityTests(void)
     RUN_TEST(test_ota_atomic_admission_manual_veto_keeps_healthy_z906);
     RUN_TEST(test_ota_loss_after_atomic_claim_does_not_retroactively_cancel);
     RUN_TEST(test_ota_manual_rollback_after_atomic_claim_is_too_late);
+    RUN_TEST(test_ota_manual_rollback_result_is_distinct_from_health_failure);
     RUN_TEST(test_ota_rollback_during_sdk_is_reported_too_late);
     return UNITY_END();
 }

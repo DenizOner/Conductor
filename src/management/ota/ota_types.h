@@ -42,7 +42,8 @@ typedef enum {
     OTA_RESULT_INCOMPATIBLE_IMAGE,
     OTA_RESULT_FLASH_FAILED,
     OTA_RESULT_HEALTH_CHECK_FAILED,
-    OTA_RESULT_ROLLBACK_DETECTED
+    OTA_RESULT_ROLLBACK_DETECTED,
+    OTA_RESULT_MANUAL_ROLLBACK_REQUESTED  /**< Operator action, not a failed health check */
 } ota_result_t;
 
 /**

@@ -393,7 +393,7 @@ void cli_dev_tools_process(char *subcmd)
         }
     } else if (strcmp(subcmd, "ota_rollback") == 0) {
         printf("[WARNING] Requesting manual rollback (may be queued during OTA admission)...\n");
-        ota_health_trigger_rollback("Manual CLI rollback request");
+        ota_health_trigger_manual_rollback("Manual CLI rollback request");
         printf("[INFO] Rollback request state: %s\n",
                ota_health_recovery_state_str(ota_health_get_recovery_state()));
     } else if (strcmp(subcmd, "wdt_status") == 0) {

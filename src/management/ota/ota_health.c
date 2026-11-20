@@ -45,6 +45,9 @@ static bool s_finalization_in_progress = false;
 /* Rollback requests during a cancellable admission must never disappear. */
 static bool s_rollback_requested_during_admission = false;
 static bool s_commit_admitted = false;
+/* Preserve operator vs verified-health recovery cause across the handoff. */
+static bool s_manual_rollback_requested = false;
+static bool s_health_failure_recorded = false;
 static ota_health_recovery_state_t s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
 /* Short state snapshots only: SDK / NVS / OTA APIs are NEVER called under this spinlock. */
 static portMUX_TYPE s_health_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -77,6 +80,15 @@ static void ota_health_refresh_mask_from_criteria(void)
 
 static void evaluate_criteria(void);
 
+/* Distinguish actual health failure from an operator's rollback request. */
+static void ota_health_note_verified_failure(const char *reason)
+{
+    portENTER_CRITICAL(&s_health_mux);
+    s_health_failure_recorded = true;
+    portEXIT_CRITICAL(&s_health_mux);
+    ota_client_note_health_failure(reason);
+}
+
 bool ota_health_init(void)
 {
     s_passed_criteria_mask = 0;
@@ -86,6 +98,8 @@ bool ota_health_init(void)
     s_finalization_in_progress = false;
     s_rollback_requested_during_admission = false;
     s_commit_admitted = false;
+    s_manual_rollback_requested = false;
+    s_health_failure_recorded = false;
     s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
     s_rollback_detected = false;
     s_sampled_cable_epoch = 0;
@@ -262,7 +276,7 @@ void ota_health_process_cycle(uint32_t elapsed_sec)
 
         if (s_seconds_in_validation >= OTA_HEALTH_VALIDATION_WINDOW_S) {
             ESP_LOGE(TAG, "Health check observation window expired before all criteria were healthy. Initiating rollback!");
-            ota_client_note_health_failure("Health criteria failed during validation window");
+            ota_health_note_verified_failure("Health criteria failed during validation window");
             ota_health_trigger_rollback("Health criteria timeout expired");
         }
         return;
@@ -308,7 +322,7 @@ void ota_health_process_cycle(uint32_t elapsed_sec)
             s_finalization_in_progress = false;
             portEXIT_CRITICAL(&s_health_mux);
             ESP_LOGE(TAG, "Fresh STATUS proof changed after health PASS; refusing OTA approval");
-            ota_client_note_health_failure("Z906 RX generation changed before OTA approval");
+            ota_health_note_verified_failure("Z906 RX generation changed before OTA approval");
             ota_health_trigger_rollback("Z906 RX integrity lost before commit admission");
             return;
         }
@@ -348,7 +362,7 @@ void ota_health_process_cycle(uint32_t elapsed_sec)
                 portEXIT_CRITICAL(&s_health_mux);
             }
             if (decision.proof_invalid) {
-                ota_client_note_health_failure("Z906 proof lost before atomic OTA admission");
+                ota_health_note_verified_failure("Z906 proof lost before atomic OTA admission");
             } else if (decision.rollback_veto) {
                 ESP_LOGW(TAG, "Operator rollback vetoed OTA admission; Z906 proof remains healthy");
             }
@@ -401,6 +415,24 @@ bool ota_health_is_pending_verify(void)
     return pending;
 }
 
+void ota_health_trigger_manual_rollback(const char *reason)
+{
+    portENTER_CRITICAL(&s_health_mux);
+    if (!s_rollback_handled) {
+        s_manual_rollback_requested = true;
+    }
+    portEXIT_CRITICAL(&s_health_mux);
+    ota_health_trigger_rollback(reason);
+}
+
+bool ota_health_was_manual_only_rollback(void)
+{
+    portENTER_CRITICAL(&s_health_mux);
+    bool manual_only = s_manual_rollback_requested && !s_health_failure_recorded;
+    portEXIT_CRITICAL(&s_health_mux);
+    return manual_only;
+}
+
 void ota_health_trigger_rollback(const char *reason)
 {
     portENTER_CRITICAL(&s_health_mux);
@@ -431,7 +463,7 @@ void ota_health_trigger_rollback(const char *reason)
         ESP_LOGE(TAG, "Rollback requested after irreversible OTA admission; cannot undo SDK write");
         return;
     }
-    ESP_LOGE(TAG, "OTA health failed: %s", reason ? reason : "Unknown");
+    ESP_LOGW(TAG, "OTA rollback requested: %s", reason ? reason : "Unknown");
     led_notification_post_cmd_result(false);
 
     bool fallback_available = s_fallback_available_fn_for_test != NULL
@@ -580,6 +612,8 @@ void ota_health_set_pending_verify_for_test(bool pending)
     s_finalization_in_progress = false;
     s_rollback_requested_during_admission = false;
     s_commit_admitted = false;
+    s_manual_rollback_requested = false;
+    s_health_failure_recorded = false;
     s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
     s_validation_start_us = ota_health_now_us();
 }
@@ -654,6 +688,8 @@ void ota_health_reset_for_test(void)
     s_finalization_in_progress = false;
     s_rollback_requested_during_admission = false;
     s_commit_admitted = false;
+    s_manual_rollback_requested = false;
+    s_health_failure_recorded = false;
     s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
     s_rollback_detected = false;
     s_time_fn_for_test = NULL;
