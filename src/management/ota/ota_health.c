@@ -211,6 +211,9 @@ static bool ota_health_claim_locked_proof(const z906_ota_status_snapshot_t *proo
 {
     ota_atomic_admission_t *decision = (ota_atomic_admission_t *)context;
     decision->evaluated = true;
+    /* The freshness clock must be read INSIDE the state mutex. A preemption
+     * before the locked callback must not extend a 5-second proof lease. */
+    decision->checked_at_us = ota_health_now_us();
     int64_t status_us = decision->use_test_status
         ? decision->test_status_us : proof->matched_status_us;
     bool proof_ok = proof->main_valid &&
@@ -340,7 +343,7 @@ void ota_health_process_cycle(uint32_t elapsed_sec)
         ota_atomic_admission_t decision = {
             .expected_cable_epoch = live.cable_epoch,
             .expected_rx_epoch = live.rx_stream_epoch,
-            .checked_at_us = ota_health_now_us(),
+            .checked_at_us = 0, /* Populated under the state mutex. */
             .use_test_status = (s_status_time_fn_for_test != NULL),
             .test_status_us = s_status_time_fn_for_test != NULL
                 ? s_status_time_fn_for_test() : 0,
@@ -415,28 +418,16 @@ bool ota_health_is_pending_verify(void)
     return pending;
 }
 
-void ota_health_trigger_manual_rollback(const char *reason)
-{
-    portENTER_CRITICAL(&s_health_mux);
-    if (!s_rollback_handled) {
-        s_manual_rollback_requested = true;
-    }
-    portEXIT_CRITICAL(&s_health_mux);
-    ota_health_trigger_rollback(reason);
-}
-
-bool ota_health_was_manual_only_rollback(void)
-{
-    portENTER_CRITICAL(&s_health_mux);
-    bool manual_only = s_manual_rollback_requested && !s_health_failure_recorded;
-    portEXIT_CRITICAL(&s_health_mux);
-    return manual_only;
-}
-
-void ota_health_trigger_rollback(const char *reason)
+/* Manual provenance and the rollback veto MUST be recorded under ONE mux.
+ * Otherwise telemetry could admit between setting the manual flag and queueing
+ * the request, misclassifying a pre-admission rollback as TOO_LATE. */
+static void ota_health_trigger_rollback_impl(const char *reason, bool manual)
 {
     portENTER_CRITICAL(&s_health_mux);
     bool already_handled = s_rollback_handled;
+    if (manual && !already_handled) {
+        s_manual_rollback_requested = true;
+    }
     bool queued = false;
     bool too_late = false;
     if (!already_handled && s_finalization_in_progress) {
@@ -496,6 +487,24 @@ void ota_health_trigger_rollback(const char *reason)
         ESP_LOGE(TAG, "Rollback rejected: %s; pending image requires manual recovery",
                  esp_err_to_name(err));
     }
+}
+
+void ota_health_trigger_rollback(const char *reason)
+{
+    ota_health_trigger_rollback_impl(reason, false);
+}
+
+void ota_health_trigger_manual_rollback(const char *reason)
+{
+    ota_health_trigger_rollback_impl(reason, true);
+}
+
+bool ota_health_was_manual_only_rollback(void)
+{
+    portENTER_CRITICAL(&s_health_mux);
+    bool manual_only = s_manual_rollback_requested && !s_health_failure_recorded;
+    portEXIT_CRITICAL(&s_health_mux);
+    return manual_only;
 }
 
 ota_health_recovery_state_t ota_health_get_recovery_state(void)

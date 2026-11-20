@@ -78,6 +78,11 @@ static void request_rollback_after_atomic_claim(void)
 {
     ota_health_trigger_manual_rollback("CLI rollback after software claim before SDK entry");
 }
+static void expire_status_before_atomic_claim(void)
+{
+    /* Longer preemption cannot allow an expired matched STATUS to be accepted. */
+    s_fake_time_us += 6000000;
+}
 
 void setUp(void)
 {
@@ -602,6 +607,20 @@ void test_ota_atomic_admission_rejects_rx_loss_before_claim(void)
     TEST_ASSERT_FALSE(ota_health_get_passed_criteria_mask() & OTA_CRITERION_Z906_COMM);
 }
 
+/** @brief 19-K: 5-second STATUS freshness must be checked at the locked claim. */
+void test_ota_atomic_admission_rejects_status_expired_during_preemption(void)
+{
+    ota_health_set_rollback_fn_for_test(mock_rollback_fn);
+    ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
+    ota_health_set_pending_verify_for_test(true);
+    ota_health_set_before_atomic_claim_fn_for_test(expire_status_before_atomic_claim);
+    s_auto_status_refresh = true;
+    for (int i = 0; i < 15; ++i) advance_health_second();
+    TEST_ASSERT_EQUAL_INT(0, s_mark_valid_call_count);
+    TEST_ASSERT_EQUAL_INT(1, s_rollback_call_count);
+    TEST_ASSERT_FALSE(ota_health_is_validated());
+}
+
 /** @brief 19-K: a manual veto is not a Z906 communication failure. */
 void test_ota_atomic_admission_manual_veto_keeps_healthy_z906(void)
 {
@@ -707,6 +726,7 @@ int runUnityTests(void)
     RUN_TEST(test_ota_rx_loss_after_final_proof_before_sdk_handoff);
     RUN_TEST(test_ota_queued_rollback_wins_over_pending_commit);
     RUN_TEST(test_ota_atomic_admission_rejects_rx_loss_before_claim);
+    RUN_TEST(test_ota_atomic_admission_rejects_status_expired_during_preemption);
     RUN_TEST(test_ota_atomic_admission_manual_veto_keeps_healthy_z906);
     RUN_TEST(test_ota_loss_after_atomic_claim_does_not_retroactively_cancel);
     RUN_TEST(test_ota_manual_rollback_after_atomic_claim_is_too_late);

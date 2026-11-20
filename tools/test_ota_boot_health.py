@@ -227,6 +227,10 @@ static void rx_drop_between_proof_and_sdk_handoff(void) {
 static void rollback_after_atomic_software_admission(void) {
     ota_health_trigger_manual_rollback("Manual request after atomic admission, before SDK entry");
 }
+static void expire_status_before_atomic_claim(void) {
+    /* Earlier snapshot passed, but timestamp must expire BEFORE the locked claim. */
+    s_now += 6000000;
+}
 int main(void) {
     /* 15 s with no verified amplifier frame must roll back. */
     reset_case();
@@ -356,6 +360,16 @@ int main(void) {
     assert(!manual_only_criteria.z906_comm_healthy);
     assert((ota_health_get_passed_criteria_mask() & OTA_CRITERION_Z906_COMM) == 0);
 
+    /* 19-K: preemption can also expire an otherwise valid STATUS time lease. */
+    reset_case();
+    advance(11);
+    report_verified_status();
+    ota_health_set_before_atomic_claim_fn_for_test(expire_status_before_atomic_claim);
+    advance(4);
+    assert(s_valid_count == 0 && s_rollback_count == 1 && !ota_health_is_validated());
+    ota_health_get_criteria(&manual_only_criteria);
+    assert(!manual_only_criteria.z906_comm_healthy);
+
     /* 19-K: queued manual request at this same point cannot falsify physical health. */
     reset_case();
     advance(11);
@@ -441,7 +455,7 @@ int main(void) {
     advance(15);
     assert(s_valid_count == 0 && s_rollback_count == 1);
 
-    puts("PASS: OTA runtime health C host harness (23 scenarios)");
+    puts("PASS: OTA runtime health C host harness (24 scenarios)");
     return 0;
 }
 """
