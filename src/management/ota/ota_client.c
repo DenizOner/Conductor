@@ -34,9 +34,13 @@ static void ota_client_sync_state_from_health(void)
         /* Pending image is NOT a healthy pending download once validation
          * failed. Do not overwrite FAILED with PENDING_VALIDATION. */
         s_state = OTA_STATE_FAILED;
-        s_last_result = ota_health_was_manual_only_rollback()
-            ? OTA_RESULT_MANUAL_ROLLBACK_REQUESTED
-            : OTA_RESULT_HEALTH_CHECK_FAILED;
+        /* Preserve an SDK error even if an operator also requested rollback.
+         * This is not evidence of a failed Z906/physical health criterion. */
+        s_last_result = ota_health_was_sdk_mark_valid_failed()
+            ? OTA_RESULT_SDK_MARK_VALID_FAILED
+            : (ota_health_was_manual_only_rollback()
+                ? OTA_RESULT_MANUAL_ROLLBACK_REQUESTED
+                : OTA_RESULT_HEALTH_CHECK_FAILED);
         return;
     }
 
@@ -120,6 +124,7 @@ const char *ota_client_result_str(ota_result_t res)
         case OTA_RESULT_HEALTH_CHECK_FAILED:  return "HEALTH_CHECK_FAILED";
         case OTA_RESULT_ROLLBACK_DETECTED:    return "ROLLBACK_DETECTED";
         case OTA_RESULT_MANUAL_ROLLBACK_REQUESTED: return "MANUAL_ROLLBACK_REQUESTED";
+        case OTA_RESULT_SDK_MARK_VALID_FAILED: return "SDK_MARK_VALID_FAILED";
         default:                              return "UNKNOWN";
     }
 }

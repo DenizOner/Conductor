@@ -73,8 +73,10 @@ void ota_health_trigger_rollback(const char *reason);
 /** @brief CLI operator rollback: records request provenance without changing health proof. */
 void ota_health_trigger_manual_rollback(const char *reason);
 
-/** @brief True only for operator recovery without a recorded failed health criterion. */
+/** @brief True only for operator recovery, without a health or SDK failure. */
 bool ota_health_was_manual_only_rollback(void);
+/** @brief True when the ESP-IDF SDK refused mark-valid. */
+bool ota_health_was_sdk_mark_valid_failed(void);
 
 /** @brief Read-only recovery diagnostic (does not initiate any recovery). */
 ota_health_recovery_state_t ota_health_get_recovery_state(void);
@@ -159,6 +161,8 @@ void ota_health_set_before_sdk_handoff_fn_for_test(ota_health_void_fn_t fn);
 void ota_health_set_before_atomic_claim_fn_for_test(ota_health_void_fn_t fn);
 /** Host/Unity: preempt AFTER the atomic claim, before the SDK mock enters. */
 void ota_health_set_after_atomic_claim_fn_for_test(ota_health_void_fn_t fn);
+/** Host/Unity: clock/preemption while state mutex is held, before health mux. */
+void ota_health_set_before_locked_claim_critical_fn_for_test(ota_health_void_fn_t fn);
 void ota_health_reset_for_test(void);
 
 #ifdef __cplusplus

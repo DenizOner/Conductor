@@ -48,6 +48,8 @@ static bool s_commit_admitted = false;
 /* Preserve operator vs verified-health recovery cause across the handoff. */
 static bool s_manual_rollback_requested = false;
 static bool s_health_failure_recorded = false;
+/* SDK mark-valid failure has priority over late operator cancellation. */
+static bool s_sdk_mark_valid_failed = false;
 static ota_health_recovery_state_t s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
 /* Short state snapshots only: SDK / NVS / OTA APIs are NEVER called under this spinlock. */
 static portMUX_TYPE s_health_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -62,6 +64,8 @@ static ota_health_void_fn_t s_before_sdk_handoff_fn_for_test = NULL;
 /* Test seams define both sides of the short software-admission boundary. */
 static ota_health_void_fn_t s_before_atomic_claim_fn_for_test = NULL;
 static ota_health_void_fn_t s_after_atomic_claim_fn_for_test = NULL;
+/* Test-only delay inside state mutex, before the health critical section. */
+static ota_health_void_fn_t s_before_locked_claim_critical_fn_for_test = NULL;
 
 static int64_t ota_health_now_us(void)
 {
@@ -100,6 +104,7 @@ bool ota_health_init(void)
     s_commit_admitted = false;
     s_manual_rollback_requested = false;
     s_health_failure_recorded = false;
+    s_sdk_mark_valid_failed = false;
     s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
     s_rollback_detected = false;
     s_sampled_cable_epoch = 0;
@@ -192,9 +197,9 @@ static void evaluate_criteria(void)
     portEXIT_CRITICAL(&s_health_mux);
 }
 
-/* The state-store mutex remains held across this short health-mux claim.
- * No API is invoked from this callback except the bounded critical section.
- * This makes the last physical proof and software admission one decision. */
+/* State mutex covers proof and callback; the health portMUX covers the
+ * ISR-safe monotonic clock, freshness comparison, and software claim.
+ * No SDK/flash/NVS, logging or blocking I/O runs under either lock. */
 typedef struct {
     uint32_t expected_cable_epoch;
     uint32_t expected_rx_epoch;
@@ -211,21 +216,25 @@ static bool ota_health_claim_locked_proof(const z906_ota_status_snapshot_t *proo
 {
     ota_atomic_admission_t *decision = (ota_atomic_admission_t *)context;
     decision->evaluated = true;
-    /* The freshness clock must be read INSIDE the state mutex. A preemption
-     * before the locked callback must not extend a 5-second proof lease. */
+    /* Test-only clock jump while the state mutex is held. This hook must
+     * never block or acquire the state mutex. */
+    if (s_before_locked_claim_critical_fn_for_test != NULL) {
+        s_before_locked_claim_critical_fn_for_test();
+    }
+
+    /* Lock order: state mutex -> health portMUX. The clock read, lease
+     * check and admission flag must be in the SAME nonpreemptible region. */
+    portENTER_CRITICAL(&s_health_mux);
     decision->checked_at_us = ota_health_now_us();
-    int64_t status_us = decision->use_test_status
+    const int64_t status_us = decision->use_test_status
         ? decision->test_status_us : proof->matched_status_us;
-    bool proof_ok = proof->main_valid &&
+    const bool proof_ok = proof->main_valid &&
         proof->cable_epoch == decision->expected_cable_epoch &&
         proof->rx_stream_epoch == decision->expected_rx_epoch &&
         status_us > s_validation_start_us &&
         status_us <= decision->checked_at_us &&
         (decision->checked_at_us - status_us) <= OTA_Z906_STATUS_MAX_AGE_US;
     decision->proof_invalid = !proof_ok;
-
-    /* Lock order: state mutex -> health portMUX, never the reverse. */
-    portENTER_CRITICAL(&s_health_mux);
     decision->rollback_veto = s_rollback_requested_during_admission;
     bool admitted = proof_ok && !decision->rollback_veto &&
                     s_finalization_in_progress && !s_commit_admitted;
@@ -387,6 +396,8 @@ void ota_health_process_cycle(uint32_t elapsed_sec)
         if (err == ESP_OK) {
             s_is_validated = true;
             s_is_pending_verify = false;
+        } else {
+            s_sdk_mark_valid_failed = true;
         }
         bool too_late_rollback = s_recovery_state == OTA_HEALTH_RECOVERY_REQUEST_TOO_LATE;
         s_finalization_in_progress = false;
@@ -502,9 +513,18 @@ void ota_health_trigger_manual_rollback(const char *reason)
 bool ota_health_was_manual_only_rollback(void)
 {
     portENTER_CRITICAL(&s_health_mux);
-    bool manual_only = s_manual_rollback_requested && !s_health_failure_recorded;
+    bool manual_only = s_manual_rollback_requested &&
+                       !s_health_failure_recorded && !s_sdk_mark_valid_failed;
     portEXIT_CRITICAL(&s_health_mux);
     return manual_only;
+}
+
+bool ota_health_was_sdk_mark_valid_failed(void)
+{
+    portENTER_CRITICAL(&s_health_mux);
+    bool failed = s_sdk_mark_valid_failed;
+    portEXIT_CRITICAL(&s_health_mux);
+    return failed;
 }
 
 ota_health_recovery_state_t ota_health_get_recovery_state(void)
@@ -623,6 +643,7 @@ void ota_health_set_pending_verify_for_test(bool pending)
     s_commit_admitted = false;
     s_manual_rollback_requested = false;
     s_health_failure_recorded = false;
+    s_sdk_mark_valid_failed = false;
     s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
     s_validation_start_us = ota_health_now_us();
 }
@@ -682,6 +703,11 @@ void ota_health_set_after_atomic_claim_fn_for_test(ota_health_void_fn_t fn)
     s_after_atomic_claim_fn_for_test = fn;
 }
 
+void ota_health_set_before_locked_claim_critical_fn_for_test(ota_health_void_fn_t fn)
+{
+    s_before_locked_claim_critical_fn_for_test = fn;
+}
+
 void ota_health_set_mark_valid_fn_for_test(ota_mark_valid_fn_t fn)
 {
     s_mark_valid_fn_for_test = fn;
@@ -699,6 +725,7 @@ void ota_health_reset_for_test(void)
     s_commit_admitted = false;
     s_manual_rollback_requested = false;
     s_health_failure_recorded = false;
+    s_sdk_mark_valid_failed = false;
     s_recovery_state = OTA_HEALTH_RECOVERY_NONE;
     s_rollback_detected = false;
     s_time_fn_for_test = NULL;
@@ -714,6 +741,7 @@ void ota_health_reset_for_test(void)
     s_before_sdk_handoff_fn_for_test = NULL;
     s_before_atomic_claim_fn_for_test = NULL;
     s_after_atomic_claim_fn_for_test = NULL;
+    s_before_locked_claim_critical_fn_for_test = NULL;
     s_sampled_cable_epoch = 0;
     s_sampled_rx_stream_epoch = 0;
     memset(&s_criteria, 0, sizeof(s_criteria));

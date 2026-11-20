@@ -128,6 +128,8 @@ static uint32_t s_rx_epoch;
 static bool s_zigbee_ok;
 static bool s_fallback_ok;
 static esp_err_t s_rollback_result = ESP_OK;
+static esp_err_t s_mark_valid_result = ESP_OK;
+static int64_t s_delay_before_critical_us = 0;
 static int s_valid_count;
 static bool s_inject_rollback_while_sdk_runs;
 static int s_rollback_count;
@@ -176,7 +178,7 @@ esp_err_t esp_ota_mark_app_valid_cancel_rollback(void) {
     if (s_inject_rollback_while_sdk_runs) {
         ota_health_trigger_manual_rollback("Manual rollback during SDK commit");
     }
-    return ESP_OK;
+    return s_mark_valid_result;
 }
 esp_err_t esp_ota_mark_app_invalid_rollback_and_reboot(void) { ++s_rollback_count; return s_rollback_result; }
 void esp_restart(void) { assert(!"unexpected forced reboot"); }
@@ -191,6 +193,8 @@ static void reset_case(void) {
     s_nvs_ok = true;
     s_fallback_ok = true;
     s_rollback_result = ESP_OK;
+    s_mark_valid_result = ESP_OK;
+    s_delay_before_critical_us = 0;
     s_valid_count = 0;
     s_inject_rollback_while_sdk_runs = false;
     s_rollback_count = 0;
@@ -230,6 +234,10 @@ static void rollback_after_atomic_software_admission(void) {
 static void expire_status_before_atomic_claim(void) {
     /* Earlier snapshot passed, but timestamp must expire BEFORE the locked claim. */
     s_now += 6000000;
+}
+static void advance_clock_inside_state_mutex_before_critical(void) {
+    /* Simulated high-priority preemption AFTER state snapshot, BEFORE health mux. */
+    s_now += s_delay_before_critical_us;
 }
 int main(void) {
     /* 15 s with no verified amplifier frame must roll back. */
@@ -370,6 +378,28 @@ int main(void) {
     ota_health_get_criteria(&manual_only_criteria);
     assert(!manual_only_criteria.z906_comm_healthy);
 
+    /* AUD-19K-01: STATUS exactly 5 seconds old when claim occurs remains valid. */
+    reset_case();
+    advance(11);
+    report_verified_status();
+    s_delay_before_critical_us = 1000000; /* STATUS age 4s before hook. */
+    ota_health_set_before_locked_claim_critical_fn_for_test(
+        advance_clock_inside_state_mutex_before_critical);
+    advance(4);
+    assert(s_valid_count == 1 && s_rollback_count == 0 && ota_health_is_validated());
+
+    /* AUD-19K-01: 5s + 1us AFTER state snapshot, BEFORE claim must fail. */
+    reset_case();
+    advance(11);
+    report_verified_status();
+    s_delay_before_critical_us = 1000001;
+    ota_health_set_before_locked_claim_critical_fn_for_test(
+        advance_clock_inside_state_mutex_before_critical);
+    advance(4);
+    assert(s_valid_count == 0 && s_rollback_count == 1 && !ota_health_is_validated());
+    ota_health_get_criteria(&manual_only_criteria);
+    assert(!manual_only_criteria.z906_comm_healthy);
+
     /* 19-K: queued manual request at this same point cannot falsify physical health. */
     reset_case();
     advance(11);
@@ -408,6 +438,57 @@ int main(void) {
     advance(4);
     assert(s_valid_count == 1 && s_rollback_count == 0 && ota_health_is_validated());
     assert(ota_health_get_recovery_state() == OTA_HEALTH_RECOVERY_REQUEST_TOO_LATE);
+
+    /* AUD-19K-02: TOO_LATE manual + SDK error => SDK error provenance. */
+    reset_case();
+    advance(11);
+    report_verified_status();
+    s_inject_rollback_while_sdk_runs = true;
+    s_mark_valid_result = ESP_FAIL;
+    advance(4);
+    assert(s_valid_count == 1 && s_rollback_count == 1 && !ota_health_is_validated());
+    assert(ota_health_get_recovery_state() == OTA_HEALTH_RECOVERY_REQUESTED);
+    assert(ota_health_was_sdk_mark_valid_failed());
+    assert(!ota_health_was_manual_only_rollback());
+    assert(s_failure_count == 0);
+    ota_health_get_criteria(&manual_only_criteria);
+    assert(manual_only_criteria.z906_comm_healthy);
+
+    /* SDK failure + late operator + no fallback never forces restart. */
+    reset_case();
+    s_fallback_ok = false;
+    advance(11);
+    report_verified_status();
+    s_inject_rollback_while_sdk_runs = true;
+    s_mark_valid_result = ESP_FAIL;
+    advance(4);
+    assert(s_valid_count == 1 && s_rollback_count == 0);
+    assert(ota_health_get_recovery_state() == OTA_HEALTH_RECOVERY_NO_FALLBACK);
+    assert(ota_health_was_sdk_mark_valid_failed());
+    assert(!ota_health_was_manual_only_rollback());
+
+    /* SDK failed commit + rejected rollback API must retain both causes. */
+    reset_case();
+    s_rollback_result = ESP_FAIL;
+    advance(11);
+    report_verified_status();
+    s_inject_rollback_while_sdk_runs = true;
+    s_mark_valid_result = ESP_FAIL;
+    advance(4);
+    assert(s_valid_count == 1 && s_rollback_count == 1);
+    assert(ota_health_get_recovery_state() == OTA_HEALTH_RECOVERY_ROLLBACK_ERROR);
+    assert(ota_health_was_sdk_mark_valid_failed());
+    assert(!ota_health_was_manual_only_rollback());
+
+    /* Without a manual request an SDK mark-valid error is still an SDK error. */
+    reset_case();
+    advance(11);
+    report_verified_status();
+    s_mark_valid_result = ESP_FAIL;
+    advance(4);
+    assert(s_valid_count == 1 && s_rollback_count == 1);
+    assert(ota_health_was_sdk_mark_valid_failed());
+    assert(!ota_health_was_manual_only_rollback());
 
     /* No fallback image: no forced restart, no false validation or repeat abort. */
     reset_case();
@@ -455,7 +536,7 @@ int main(void) {
     advance(15);
     assert(s_valid_count == 0 && s_rollback_count == 1);
 
-    puts("PASS: OTA runtime health C host harness (24 scenarios)");
+    puts("PASS: OTA runtime health C host harness (30 scenarios)");
     return 0;
 }
 """
