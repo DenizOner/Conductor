@@ -47,16 +47,31 @@ bool wdt_manager_init(uint32_t timeout_seconds)
 bool wdt_manager_register_task(void)
 {
     esp_err_t err = esp_task_wdt_add(NULL);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "Failed to register task with TWDT (err: 0x%x)", err);
-        return false;
+    if (err == ESP_OK) {
+        return true;
     }
-    return true;
+    /* Registration error is not proof of a subscription. Only the
+     * authoritative SDK status API can confirm an already-subscribed task. */
+    if (esp_task_wdt_status(NULL) == ESP_OK) {
+        return true;
+    }
+    ESP_LOGE(TAG, "Failed to register task with TWDT (err: 0x%x)", err);
+    return false;
+}
+
+bool wdt_manager_is_current_task_registered(void)
+{
+    return esp_task_wdt_status(NULL) == ESP_OK;
+}
+
+bool wdt_manager_reset_checked(void)
+{
+    return esp_task_wdt_reset() == ESP_OK;
 }
 
 void wdt_manager_reset(void)
 {
-    esp_task_wdt_reset();
+    (void)wdt_manager_reset_checked();
 }
 
 bool wdt_manager_is_initialized(void)

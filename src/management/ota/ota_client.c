@@ -28,6 +28,22 @@ static const esp_partition_t *s_target_partition  = NULL;
 
 static void ota_client_sync_state_from_health(void)
 {
+    ota_health_recovery_state_t recovery = ota_health_get_recovery_state();
+    if (recovery != OTA_HEALTH_RECOVERY_NONE &&
+        recovery != OTA_HEALTH_RECOVERY_REQUEST_TOO_LATE) {
+        /* Pending image is NOT a healthy pending download once validation
+         * failed. Do not overwrite FAILED with PENDING_VALIDATION. */
+        s_state = OTA_STATE_FAILED;
+        /* Preserve an SDK error even if an operator also requested rollback.
+         * This is not evidence of a failed Z906/physical health criterion. */
+        s_last_result = ota_health_was_sdk_mark_valid_failed()
+            ? OTA_RESULT_SDK_MARK_VALID_FAILED
+            : (ota_health_was_manual_only_rollback()
+                ? OTA_RESULT_MANUAL_ROLLBACK_REQUESTED
+                : OTA_RESULT_HEALTH_CHECK_FAILED);
+        return;
+    }
+
     if (ota_health_is_pending_verify()) {
         if (s_state != OTA_STATE_DOWNLOADING &&
             s_state != OTA_STATE_VERIFYING &&
@@ -37,8 +53,11 @@ static void ota_client_sync_state_from_health(void)
         return;
     }
 
-    if (s_state == OTA_STATE_PENDING_VALIDATION) {
+    if (s_state == OTA_STATE_PENDING_VALIDATION && ota_health_is_validated()) {
+        /* A cleared pending flag alone is not proof of a committed image.
+         * Publish SUCCESS only after OTA health confirms SDK mark-valid. */
         s_state = OTA_STATE_SUCCESS;
+        s_last_result = OTA_RESULT_SUCCESS;
     } else if (ota_health_was_rollback_detected() && s_state == OTA_STATE_IDLE) {
         s_state = OTA_STATE_ROLLBACK;
     }
@@ -107,6 +126,8 @@ const char *ota_client_result_str(ota_result_t res)
         case OTA_RESULT_FLASH_FAILED:         return "FLASH_FAILED";
         case OTA_RESULT_HEALTH_CHECK_FAILED:  return "HEALTH_CHECK_FAILED";
         case OTA_RESULT_ROLLBACK_DETECTED:    return "ROLLBACK_DETECTED";
+        case OTA_RESULT_MANUAL_ROLLBACK_REQUESTED: return "MANUAL_ROLLBACK_REQUESTED";
+        case OTA_RESULT_SDK_MARK_VALID_FAILED: return "SDK_MARK_VALID_FAILED";
         default:                              return "UNKNOWN";
     }
 }
@@ -165,7 +186,7 @@ void ota_client_handle_image_notify(uint8_t payload_type,
 
 void ota_client_process_cycle(void)
 {
-    /* 1. Process post-update health check (call from zigbee_task, ~1 Hz) */
+    /* 1. Process post-update health check (owned by telemetry_task, ~1 Hz). */
     ota_health_process_cycle(1);
     ota_client_sync_state_from_health();
 

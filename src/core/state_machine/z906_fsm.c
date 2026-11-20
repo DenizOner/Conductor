@@ -26,30 +26,78 @@ static const char *TAG = "Z906_FSM";
 
 static z906_fsm_state_t s_fsm_state = FSM_STATE_UNINITIALIZED;
 static z906_codec_ctx_t s_amp_codec_ctx;
+/* First byte's UART task read time, not the later FSM queue drain time. */
+static int64_t s_amp_frame_started_us = 0;
+static uint32_t s_fsm_cable_epoch = 0;
+static uint32_t s_fsm_rx_stream_epoch = 0;
+/* After RX stream loss, ignore payload-looking standalone opcodes until AA. */
+static bool s_amp_resync_required = false;
+
+/* Public diagnostics must reflect the current verified physical snapshot,
+ * never a delayed FSM transition from an old cable/RX epoch. */
+static z906_fsm_state_t fsm_derive_physical_state(void)
+{
+    if (s_fsm_state == FSM_STATE_UNINITIALIZED) {
+        return s_fsm_state;
+    }
+    z906_ota_status_snapshot_t ready = { 0 };
+    if (!z906_state_get_ota_status_snapshot(&ready)) {
+        return s_fsm_state; /* State service not initialized yet. */
+    }
+    z906_state_t physical;
+    z906_state_get(&physical);
+    if (!physical.cable_connected || !physical.main_state_valid) {
+        return FSM_STATE_FAULT; /* No verified amplifier state. */
+    }
+    if (s_fsm_state == FSM_STATE_SPEAKER_TEST && physical.power) {
+        return FSM_STATE_SPEAKER_TEST;
+    }
+    if (!physical.power) {
+        return FSM_STATE_STANDBY;
+    }
+    return physical.mute ? FSM_STATE_MUTED : FSM_STATE_ACTIVE;
+}
 
 static void fsm_set_state(z906_fsm_state_t new_state)
 {
+    /* CONFIG/echo state writes are atomic, but scheduling can change RX epoch
+     * between that commit and this diagnostic transition. Reconcile here. */
+    if (new_state == FSM_STATE_ACTIVE || new_state == FSM_STATE_MUTED ||
+        new_state == FSM_STATE_STANDBY) {
+        new_state = fsm_derive_physical_state();
+    }
     if (s_fsm_state != new_state) {
         ESP_LOGI(TAG, "State transition: %s -> %s",
                  z906_fsm_state_str(s_fsm_state), z906_fsm_state_str(new_state));
         s_fsm_state = new_state;
 
-        /* Broadcast state change event to notification subscribers */
-        z906_event_t evt = { .type = EVENT_STATE_CHANGED };
-        event_bus_post(&evt, 0);
+        /* If a higher-priority RX loss invalidated proof during this log,
+         * don't publish an obsolete transition. State observers operate
+         * separately on coherent physical state, not on this event's cache. */
+        if (new_state == FSM_STATE_BOOTING ||
+            fsm_derive_physical_state() == new_state) {
+            z906_event_t evt = { .type = EVENT_STATE_CHANGED };
+            event_bus_post(&evt, 0);
+        }
     }
 }
 
 bool z906_fsm_init(void)
 {
     z906_codec_init(&s_amp_codec_ctx);
+    s_amp_frame_started_us = 0;
+    s_fsm_cable_epoch = z906_state_get_cable_epoch();
+    s_fsm_rx_stream_epoch = z906_state_get_amp_rx_stream_epoch();
+    s_amp_resync_required = false;
     fsm_set_state(FSM_STATE_BOOTING);
     return true;
 }
 
 z906_fsm_state_t z906_fsm_get_state(void)
 {
-    return s_fsm_state;
+    /* A concurrent cable/RX loss cannot leave public FSM diagnostics ACTIVE
+     * just because the event queue has not yet delivered its next item. */
+    return fsm_derive_physical_state();
 }
 
 const char *z906_fsm_state_str(z906_fsm_state_t state)
@@ -72,34 +120,48 @@ static void handle_console_byte(uint8_t byte)
     z906_uart_hal_write_amp(&byte, 1);
 }
 
-static void handle_amp_byte(uint8_t byte)
+static void handle_amp_byte(uint8_t byte, int64_t received_at_us,
+                            uint32_t cable_epoch, uint32_t rx_stream_epoch)
 {
     /* 1. Forward raw byte to physical console */
     z906_uart_hal_write_console(&byte, 1);
 
-    /* 2. Process stream classifier with strict multi-byte vs single-byte isolation */
+    /* 2. Use the first byte's UART task read time instead of FSM handling time.
+     * ESP-IDF UART ring buffers do not supply hardware byte-arrival timestamps. */
+    if (!z906_codec_is_frame_in_progress(&s_amp_codec_ctx) && byte == 0xAA) {
+        s_amp_frame_started_us = received_at_us;
+    }
     z906_decoded_packet_t pkt;
     z906_parse_result_t parse_res = z906_codec_feed_byte(&s_amp_codec_ctx, byte, &pkt);
+    if (parse_res == Z906_PARSE_RESULT_RESYNC_DROP) {
+        s_amp_frame_started_us = 0;
+    }
 
     if (parse_res == Z906_PARSE_RESULT_FRAME_COMPLETE) {
         switch (pkt.type) {
             case Z906_PACKET_CONFIG: {
+                /* The complete, LRC/semantics-checked CONFIG is committed
+                 * in one state-mutex transaction. A concurrent cable transition
+                 * rejects all fields, not merely the final validity bit. */
+                z906_state_t confirmed = { 0 };
+                confirmed.volume = pkt.data.config.volume;
+                confirmed.volume_bass = pkt.data.config.volume_bass;
+                confirmed.volume_center = pkt.data.config.volume_center;
+                confirmed.volume_rear = pkt.data.config.volume_rear;
+                confirmed.input = pkt.data.config.input;
+                confirmed.effect = pkt.data.config.effect;
+                confirmed.mute = pkt.data.config.mute;
+                confirmed.digital_signal_status = pkt.data.config.digital_signal_status;
+                confirmed.auto_standby_enabled = pkt.data.config.auto_standby_enabled;
+                /* The amplifier's Byte 17 defines true physical power. */
+                confirmed.power = !pkt.data.config.standby;
+                if (!z906_state_apply_verified_config_for_epoch(cable_epoch, rx_stream_epoch, &confirmed)) {
+                    ESP_LOGW(TAG, "Discarding CONFIG from stale/unplugged cable epoch");
+                    break;
+                }
                 ESP_LOGI(TAG, "Confirmed Amp Config: Vol=%d, Input=%d, Effect=%d, Mute=%d, Standby=%d",
                          pkt.data.config.volume, pkt.data.config.input, pkt.data.config.effect,
                          pkt.data.config.mute, pkt.data.config.standby);
-                z906_state_set_volume(pkt.data.config.volume);
-                z906_state_set_trim(0, pkt.data.config.volume_bass);
-                z906_state_set_trim(1, pkt.data.config.volume_center);
-                z906_state_set_trim(2, pkt.data.config.volume_rear);
-                z906_state_set_input(pkt.data.config.input);
-                z906_state_set_effect(pkt.data.config.effect);
-                z906_state_set_mute(pkt.data.config.mute);
-                z906_state_set_digital_signal_status(pkt.data.config.digital_signal_status);
-                z906_state_set_auto_standby(pkt.data.config.auto_standby_enabled);
-
-                /* Set confirmed physical power state directly from Byte 17 (0 = ON, 1 = Standby) */
-                z906_state_set_power(!pkt.data.config.standby);
-                z906_state_set_main_valid(true);
                 if (pkt.data.config.standby) {
                     fsm_set_state(FSM_STATE_STANDBY);
                 } else if (pkt.data.config.mute) {
@@ -107,7 +169,7 @@ static void handle_amp_byte(uint8_t byte)
                 } else {
                     fsm_set_state(FSM_STATE_ACTIVE);
                 }
-                telemetry_notify_response_received(TELEMETRY_QUERY_STATUS);
+                telemetry_notify_response_received(TELEMETRY_QUERY_STATUS, s_amp_frame_started_us);
                 break;
             }
 
@@ -118,20 +180,29 @@ static void handle_amp_byte(uint8_t byte)
                 }
                 ESP_LOGI(TAG, "Confirmed Amp Temperatures: [%d, %d, %d] \xc2\xb0""C",
                          pkt.data.temp.temp_celsius[0], pkt.data.temp.temp_celsius[1], pkt.data.temp.temp_celsius[2]);
-                z906_state_set_temperature(pkt.data.temp.temp_celsius);
-                telemetry_notify_response_received(TELEMETRY_QUERY_TEMP);
+                if (z906_state_apply_temperature_for_generations(
+                        cable_epoch, rx_stream_epoch, pkt.data.temp.temp_celsius)) {
+                    telemetry_notify_response_received(TELEMETRY_QUERY_TEMP,
+                                                       s_amp_frame_started_us);
+                }
                 break;
 
             case Z906_PACKET_IDLE:
                 ESP_LOGD(TAG, "Confirmed Amp Idle Duration: %lu s", (unsigned long)pkt.data.idle.idle_seconds);
-                z906_state_set_idle_seconds(pkt.data.idle.idle_seconds);
-                telemetry_notify_response_received(TELEMETRY_QUERY_IDLE);
+                if (z906_state_apply_idle_for_generations(
+                        cable_epoch, rx_stream_epoch, pkt.data.idle.idle_seconds)) {
+                    telemetry_notify_response_received(TELEMETRY_QUERY_IDLE,
+                                                       s_amp_frame_started_us);
+                }
                 break;
 
             case Z906_PACKET_INPUT_VOL:
                 ESP_LOGD(TAG, "Confirmed Amp Input Signal Level: %lu", (unsigned long)pkt.data.input_vol.input_volume);
-                z906_state_set_input_signal_level(pkt.data.input_vol.input_volume);
-                telemetry_notify_response_received(TELEMETRY_QUERY_INPUT_VOL);
+                if (z906_state_apply_input_level_for_generations(
+                        cable_epoch, rx_stream_epoch, pkt.data.input_vol.input_volume)) {
+                    telemetry_notify_response_received(TELEMETRY_QUERY_INPUT_VOL,
+                                                       s_amp_frame_started_us);
+                }
                 break;
 
             default:
@@ -147,104 +218,58 @@ static void handle_amp_byte(uint8_t byte)
         return;
     }
 
-    /* 3. Process standalone single-byte telemetry confirmations & physical button echoes per protocol.rst */
+    /* 3. Both epoch validation and any standalone echo state change occur
+     * under ONE state mutex transaction, after physical raw passthrough. */
+    if (!z906_state_apply_amp_echo_for_generations(cable_epoch, rx_stream_epoch,
+                                                   byte)) {
+        return;
+    }
     switch ((z906_cmd_header_t)byte) {
         case Z906_CMD_STANDBY_SAVE: /* 0x36: Saves settings & transitions to standby */
-            z906_state_set_power(false);
             fsm_set_state(FSM_STATE_STANDBY);
             break;
 
         case Z906_CMD_AMP_MUTED: /* 0x20: Amplifier reports muted status */
-            z906_state_set_mute(true);
             fsm_set_state(FSM_STATE_MUTED);
             break;
 
         case Z906_CMD_AMP_UNMUTED: /* 0x21: Amplifier reports unmuted status */
-            z906_state_set_mute(false);
             fsm_set_state(FSM_STATE_ACTIVE);
             break;
 
-        /* Physical Master Volume Up / Down Echoes */
-        case Z906_CMD_VOLUME_UP: {
-            z906_state_t cur;
-            z906_state_get(&cur);
-            z906_state_set_volume(cur.volume + 1);
-            break;
-        }
-        case Z906_CMD_VOLUME_DOWN: {
-            z906_state_t cur;
-            z906_state_get(&cur);
-            if (cur.volume > 0) z906_state_set_volume(cur.volume - 1);
-            break;
-        }
-
-        /* Physical Channel Trim Volume Echoes */
-        case Z906_CMD_VOLUME_BASS_UP: {
-            z906_state_t cur;
-            z906_state_get(&cur);
-            z906_state_set_trim(0, cur.volume_bass + 1);
-            break;
-        }
-        case Z906_CMD_VOLUME_BASS_DOWN: {
-            z906_state_t cur;
-            z906_state_get(&cur);
-            if (cur.volume_bass > 0) z906_state_set_trim(0, cur.volume_bass - 1);
-            break;
-        }
-        case Z906_CMD_VOLUME_CENTER_UP: {
-            z906_state_t cur;
-            z906_state_get(&cur);
-            z906_state_set_trim(1, cur.volume_center + 1);
-            break;
-        }
-        case Z906_CMD_VOLUME_CENTER_DOWN: {
-            z906_state_t cur;
-            z906_state_get(&cur);
-            if (cur.volume_center > 0) z906_state_set_trim(1, cur.volume_center - 1);
-            break;
-        }
-        case Z906_CMD_VOLUME_REAR_UP: {
-            z906_state_t cur;
-            z906_state_get(&cur);
-            z906_state_set_trim(2, cur.volume_rear + 1);
-            break;
-        }
-        case Z906_CMD_VOLUME_REAR_DOWN: {
-            z906_state_t cur;
-            z906_state_get(&cur);
-            if (cur.volume_rear > 0) z906_state_set_trim(2, cur.volume_rear - 1);
-            break;
-        }
-
-        /* Physical Input Selection Echoes (protocol.rst Section: Input selection) */
-        case Z906_CMD_SELECT_INPUT_1: z906_state_set_input(Z906_INPUT_SIX_CHANNEL_DIRECT); break;
-        case Z906_CMD_SELECT_INPUT_2: z906_state_set_input(Z906_INPUT_RCA_STEREO);          break;
-        case Z906_CMD_SELECT_INPUT_3: z906_state_set_input(Z906_INPUT_OPTICAL_1);           break;
-        case Z906_CMD_SELECT_INPUT_4: z906_state_set_input(Z906_INPUT_OPTICAL_2);           break;
-        case Z906_CMD_SELECT_INPUT_5: z906_state_set_input(Z906_INPUT_DIGITAL_COAXIAL);     break;
-        case Z906_CMD_SELECT_INPUT_6: z906_state_set_input(Z906_INPUT_AUXILIARY);           break;
-
-        /* Physical Effect Selection Echoes (protocol.rst Section: Effect selection) */
-        case Z906_CMD_SELECT_EFFECT_3D:   z906_state_set_effect(Z906_EFFECT_3D); break;
-        case Z906_CMD_SELECT_EFFECT_2_1:  z906_state_set_effect(Z906_EFFECT_2_1); break;
-        case Z906_CMD_SELECT_EFFECT_4_1:  z906_state_set_effect(Z906_EFFECT_4_1); break;
-        case Z906_CMD_SELECT_EFFECT_NONE: z906_state_set_effect(Z906_EFFECT_NONE); break;
-
         default:
-            /* Decode state check (0x17 to 0x1F, protocol.rst Section: Decode state) */
+            /* Other accepted echoes were already applied by the state store. */
             if (byte >= Z906_DECODE_5_1 && byte <= Z906_DECODE_UNKNOWN) {
                 ESP_LOGI(TAG, "Amplifier decode state: %s (0x%02X)",
                          z906_cmd_decode_state_str(byte), byte);
-                z906_state_set_digital_signal_status(byte);
             }
             break;
+    }
+}
+
+static void fsm_sync_rx_generations(void)
+{
+    uint32_t cable = z906_state_get_cable_epoch();
+    uint32_t stream = z906_state_get_amp_rx_stream_epoch();
+    if (cable != s_fsm_cable_epoch || stream != s_fsm_rx_stream_epoch) {
+        /* Shared state, not lossy EventBus delivery, owns invalidation.
+         * An old queued CONFIG cannot resurrect status after a final drop. */
+        z906_codec_init(&s_amp_codec_ctx);
+        s_amp_frame_started_us = 0;
+        s_amp_resync_required = true;
+        s_fsm_cable_epoch = cable;
+        s_fsm_rx_stream_epoch = stream;
+        /* Reconcile even if the cable notification was dropped. */
+        fsm_set_state(fsm_derive_physical_state());
     }
 }
 
 void z906_fsm_step(TickType_t block_time)
 {
     z906_event_t event;
-    if (!event_bus_receive(&event, block_time)) {
+    bool received = event_bus_receive(&event, block_time);
+    fsm_sync_rx_generations();
+    if (!received) {
         return;
     }
 
@@ -254,16 +279,40 @@ void z906_fsm_step(TickType_t block_time)
             break;
 
         case EVENT_AMP_RX_BYTE:
-            handle_amp_byte(event.data.raw_byte);
+            if (event.cable_epoch != s_fsm_cable_epoch ||
+                event.rx_stream_epoch != s_fsm_rx_stream_epoch) {
+                /* Passthrough byte is preserved, but never decoded as new state. */
+                z906_uart_hal_write_console(&event.data.raw_byte, 1);
+                break;
+            }
+             if (s_amp_resync_required && event.data.raw_byte != 0xAA) {
+                /* Preserve raw amplifier-to-console passthrough but never
+                 * interpret an orphaned frame payload as a standalone echo. */
+                z906_uart_hal_write_console(&event.data.raw_byte, 1);
+                break;
+            }
+            if (s_amp_resync_required) {
+                s_amp_resync_required = false;
+            }
+            handle_amp_byte(event.data.raw_byte, event.received_at_us,
+                            event.cable_epoch, event.rx_stream_epoch);
             break;
 
-        case EVENT_CABLE_STATUS_CHANGED:
-            if (!event.data.cable_connected) {
+        case EVENT_CABLE_STATUS_CHANGED: {
+            /* Advisory only: a stale queued cable event must not reset a valid
+             * newer frame or override the current physical connection state. */
+            z906_state_t physical;
+            z906_state_get(&physical);
+            if (event.data.cable_connected != physical.cable_connected) {
+                break;
+            }
+            if (!physical.cable_connected) {
                 fsm_set_state(FSM_STATE_FAULT);
             } else if (s_fsm_state == FSM_STATE_FAULT) {
                 fsm_set_state(FSM_STATE_STANDBY);
             }
             break;
+        }
 
         default:
             break;
