@@ -74,6 +74,10 @@ static void request_rollback_at_sdk_handoff(void)
 {
     ota_health_trigger_rollback("CLI rollback before SDK admission");
 }
+static void request_rollback_after_atomic_claim(void)
+{
+    ota_health_trigger_rollback("CLI rollback after software claim before SDK entry");
+}
 
 void setUp(void)
 {
@@ -573,6 +577,73 @@ void test_ota_queued_rollback_wins_over_pending_commit(void)
     TEST_ASSERT_EQUAL_INT(1, s_rollback_call_count);
     TEST_ASSERT_EQUAL(OTA_HEALTH_RECOVERY_REQUESTED,
                       ota_health_get_recovery_state());
+    ota_health_criteria_t criteria = {0};
+    ota_health_get_criteria(&criteria);
+    TEST_ASSERT_TRUE(criteria.z906_comm_healthy);
+    TEST_ASSERT_TRUE(ota_health_get_passed_criteria_mask() & OTA_CRITERION_Z906_COMM);
+}
+
+/** @brief 19-K: the former final snapshot-to-claim gap must fail closed. */
+void test_ota_atomic_admission_rejects_rx_loss_before_claim(void)
+{
+    ota_health_set_rollback_fn_for_test(mock_rollback_fn);
+    ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
+    ota_health_set_pending_verify_for_test(true);
+    ota_health_set_before_atomic_claim_fn_for_test(inject_rx_drop_at_final_admission);
+    s_auto_status_refresh = true;
+    for (int i = 0; i < 15; ++i) advance_health_second();
+    TEST_ASSERT_EQUAL_INT(0, s_mark_valid_call_count);
+    TEST_ASSERT_EQUAL_INT(1, s_rollback_call_count);
+    ota_health_criteria_t criteria = {0};
+    ota_health_get_criteria(&criteria);
+    TEST_ASSERT_FALSE(criteria.z906_comm_healthy);
+    TEST_ASSERT_FALSE(ota_health_get_passed_criteria_mask() & OTA_CRITERION_Z906_COMM);
+}
+
+/** @brief 19-K: a manual veto is not a Z906 communication failure. */
+void test_ota_atomic_admission_manual_veto_keeps_healthy_z906(void)
+{
+    ota_health_set_rollback_fn_for_test(mock_rollback_fn);
+    ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
+    ota_health_set_pending_verify_for_test(true);
+    ota_health_set_before_atomic_claim_fn_for_test(request_rollback_at_sdk_handoff);
+    s_auto_status_refresh = true;
+    for (int i = 0; i < 15; ++i) advance_health_second();
+    TEST_ASSERT_EQUAL_INT(0, s_mark_valid_call_count);
+    TEST_ASSERT_EQUAL_INT(1, s_rollback_call_count);
+    ota_health_criteria_t criteria = {0};
+    ota_health_get_criteria(&criteria);
+    TEST_ASSERT_TRUE(criteria.z906_comm_healthy);
+    TEST_ASSERT_TRUE(ota_health_get_passed_criteria_mask() & OTA_CRITERION_Z906_COMM);
+}
+
+/** @brief 19-K option A: later physical loss does not undo software admission. */
+void test_ota_loss_after_atomic_claim_does_not_retroactively_cancel(void)
+{
+    ota_health_set_rollback_fn_for_test(mock_rollback_fn);
+    ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
+    ota_health_set_pending_verify_for_test(true);
+    ota_health_set_after_atomic_claim_fn_for_test(inject_rx_drop_at_final_admission);
+    s_auto_status_refresh = true;
+    for (int i = 0; i < 15; ++i) advance_health_second();
+    TEST_ASSERT_EQUAL_INT(1, s_mark_valid_call_count);
+    TEST_ASSERT_EQUAL_INT(0, s_rollback_call_count);
+    TEST_ASSERT_TRUE(ota_health_is_validated());
+}
+
+/** @brief 19-K option A: after-claim CLI request is diagnosed TOO_LATE. */
+void test_ota_manual_rollback_after_atomic_claim_is_too_late(void)
+{
+    ota_health_set_rollback_fn_for_test(mock_rollback_fn);
+    ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
+    ota_health_set_pending_verify_for_test(true);
+    ota_health_set_after_atomic_claim_fn_for_test(request_rollback_after_atomic_claim);
+    s_auto_status_refresh = true;
+    for (int i = 0; i < 15; ++i) advance_health_second();
+    TEST_ASSERT_EQUAL_INT(1, s_mark_valid_call_count);
+    TEST_ASSERT_EQUAL_INT(0, s_rollback_call_count);
+    TEST_ASSERT_EQUAL(OTA_HEALTH_RECOVERY_REQUEST_TOO_LATE,
+                      ota_health_get_recovery_state());
 }
 
 /** @brief A rollback during the irreversible API cannot be falsely reported. */
@@ -619,6 +690,10 @@ int runUnityTests(void)
     RUN_TEST(test_ota_final_admission_loss_without_fallback_remains_pending);
     RUN_TEST(test_ota_rx_loss_after_final_proof_before_sdk_handoff);
     RUN_TEST(test_ota_queued_rollback_wins_over_pending_commit);
+    RUN_TEST(test_ota_atomic_admission_rejects_rx_loss_before_claim);
+    RUN_TEST(test_ota_atomic_admission_manual_veto_keeps_healthy_z906);
+    RUN_TEST(test_ota_loss_after_atomic_claim_does_not_retroactively_cancel);
+    RUN_TEST(test_ota_manual_rollback_after_atomic_claim_is_too_late);
     RUN_TEST(test_ota_rollback_during_sdk_is_reported_too_late);
     return UNITY_END();
 }

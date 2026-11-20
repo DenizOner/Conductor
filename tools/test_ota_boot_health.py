@@ -94,6 +94,8 @@ typedef struct {
     int64_t matched_status_us;
 } z906_ota_status_snapshot_t;
 bool z906_state_get_ota_status_snapshot(z906_ota_status_snapshot_t *);
+typedef bool (*z906_ota_admission_claim_fn_t)(const z906_ota_status_snapshot_t *, void *);
+bool z906_state_with_locked_ota_snapshot(z906_ota_admission_claim_fn_t, void *);
 int64_t z906_state_get_main_status_time_us(void);
 int64_t z906_state_get_matched_status_reply_time_us(void);
 """,
@@ -151,6 +153,12 @@ bool z906_state_get_ota_status_snapshot(z906_ota_status_snapshot_t *out) {
     out->rx_stream_epoch = s_rx_epoch;
     out->matched_status_us = s_z906_ok ? s_status_at_us : 0;
     return true;
+}
+bool z906_state_with_locked_ota_snapshot(z906_ota_admission_claim_fn_t claim, void *ctx) {
+    z906_ota_status_snapshot_t snap = {0};
+    if (!claim || !z906_state_get_ota_status_snapshot(&snap)) return false;
+    /* Host mock has no FreeRTOS scheduling: target Unity tests real mutex. */
+    return claim(&snap, ctx);
 }
 int64_t z906_state_get_main_status_time_us(void) { return s_z906_ok ? s_status_at_us : 0; }
 int64_t z906_state_get_matched_status_reply_time_us(void) { return s_z906_ok ? s_status_at_us : 0; }
@@ -215,6 +223,9 @@ static void manual_rollback_during_admission(void) {
 static void rx_drop_between_proof_and_sdk_handoff(void) {
     /* Preemption after first snapshot, before the final SDK claim. */
     drop_after_pass_before_mark_valid();
+}
+static void rollback_after_atomic_software_admission(void) {
+    ota_health_trigger_rollback("Manual request after atomic admission, before SDK entry");
 }
 int main(void) {
     /* 15 s with no verified amplifier frame must roll back. */
@@ -314,6 +325,11 @@ int main(void) {
     advance(4);
     assert(s_valid_count == 0 && s_rollback_count == 1);
     assert(ota_health_get_recovery_state() == OTA_HEALTH_RECOVERY_REQUESTED);
+    ota_health_criteria_t manual_only_criteria = {0};
+    ota_health_get_criteria(&manual_only_criteria);
+    assert(manual_only_criteria.z906_comm_healthy);
+    assert((ota_health_get_passed_criteria_mask() & OTA_CRITERION_Z906_COMM) != 0);
+    assert(s_failure_count == 0); /* User request is not a health-check failure. */
 
     /* I-02 no-fallback: queued manual rollback never forces a reboot. */
     reset_case();
@@ -324,6 +340,47 @@ int main(void) {
     advance(4);
     assert(s_valid_count == 0 && s_rollback_count == 0);
     assert(ota_health_get_recovery_state() == OTA_HEALTH_RECOVERY_NO_FALLBACK);
+    ota_health_get_criteria(&manual_only_criteria);
+    assert(manual_only_criteria.z906_comm_healthy && s_failure_count == 0);
+
+    /* 19-K: RX drop precisely after a previous snapshot, before atomic claim. */
+    reset_case();
+    advance(11);
+    report_verified_status();
+    ota_health_set_before_atomic_claim_fn_for_test(drop_after_pass_before_mark_valid);
+    advance(4);
+    assert(s_valid_count == 0 && s_rollback_count == 1 && !ota_health_is_validated());
+    ota_health_get_criteria(&manual_only_criteria);
+    assert(!manual_only_criteria.z906_comm_healthy);
+    assert((ota_health_get_passed_criteria_mask() & OTA_CRITERION_Z906_COMM) == 0);
+
+    /* 19-K: queued manual request at this same point cannot falsify physical health. */
+    reset_case();
+    advance(11);
+    report_verified_status();
+    ota_health_set_before_atomic_claim_fn_for_test(manual_rollback_during_admission);
+    advance(4);
+    assert(s_valid_count == 0 && s_rollback_count == 1 && s_failure_count == 0);
+    ota_health_get_criteria(&manual_only_criteria);
+    assert(manual_only_criteria.z906_comm_healthy);
+    assert((ota_health_get_passed_criteria_mask() & OTA_CRITERION_Z906_COMM) != 0);
+
+    /* 19-K option A: loss AFTER the atomic claim cannot retroactively veto SDK. */
+    reset_case();
+    advance(11);
+    report_verified_status();
+    ota_health_set_after_atomic_claim_fn_for_test(drop_after_pass_before_mark_valid);
+    advance(4);
+    assert(s_valid_count == 1 && s_rollback_count == 0 && ota_health_is_validated());
+
+    /* Option A: manual rollback after the atomic claim is TOO_LATE pre SDK entry. */
+    reset_case();
+    advance(11);
+    report_verified_status();
+    ota_health_set_after_atomic_claim_fn_for_test(rollback_after_atomic_software_admission);
+    advance(4);
+    assert(s_valid_count == 1 && s_rollback_count == 0 && ota_health_is_validated());
+    assert(ota_health_get_recovery_state() == OTA_HEALTH_RECOVERY_REQUEST_TOO_LATE);
 
     /* I-02 after SDK entry: rollback request is diagnosed TOO_LATE, never
      * silently ignored, and a second irreversible OTA call does not race. */

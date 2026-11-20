@@ -56,6 +56,9 @@ static uint32_t s_sampled_rx_stream_epoch = 0;
 static ota_health_void_fn_t s_before_final_admission_fn_for_test = NULL;
 /* Deterministic interleaving after the first proof check, before SDK handoff. */
 static ota_health_void_fn_t s_before_sdk_handoff_fn_for_test = NULL;
+/* Test seams define both sides of the short software-admission boundary. */
+static ota_health_void_fn_t s_before_atomic_claim_fn_for_test = NULL;
+static ota_health_void_fn_t s_after_atomic_claim_fn_for_test = NULL;
 
 static int64_t ota_health_now_us(void)
 {
@@ -175,6 +178,55 @@ static void evaluate_criteria(void)
     portEXIT_CRITICAL(&s_health_mux);
 }
 
+/* The state-store mutex remains held across this short health-mux claim.
+ * No API is invoked from this callback except the bounded critical section.
+ * This makes the last physical proof and software admission one decision. */
+typedef struct {
+    uint32_t expected_cable_epoch;
+    uint32_t expected_rx_epoch;
+    int64_t checked_at_us;
+    int64_t test_status_us;
+    bool use_test_status;
+    bool evaluated;
+    bool proof_invalid;
+    bool rollback_veto;
+} ota_atomic_admission_t;
+
+static bool ota_health_claim_locked_proof(const z906_ota_status_snapshot_t *proof,
+                                          void *context)
+{
+    ota_atomic_admission_t *decision = (ota_atomic_admission_t *)context;
+    decision->evaluated = true;
+    int64_t status_us = decision->use_test_status
+        ? decision->test_status_us : proof->matched_status_us;
+    bool proof_ok = proof->main_valid &&
+        proof->cable_epoch == decision->expected_cable_epoch &&
+        proof->rx_stream_epoch == decision->expected_rx_epoch &&
+        status_us > s_validation_start_us &&
+        status_us <= decision->checked_at_us &&
+        (decision->checked_at_us - status_us) <= OTA_Z906_STATUS_MAX_AGE_US;
+    decision->proof_invalid = !proof_ok;
+
+    /* Lock order: state mutex -> health portMUX, never the reverse. */
+    portENTER_CRITICAL(&s_health_mux);
+    decision->rollback_veto = s_rollback_requested_during_admission;
+    bool admitted = proof_ok && !decision->rollback_veto &&
+                    s_finalization_in_progress && !s_commit_admitted;
+    if (admitted) {
+        s_commit_admitted = true; /* Linearization point for product option A. */
+    } else {
+        s_finalization_in_progress = false;
+        s_rollback_requested_during_admission = false;
+        /* A human rollback request does not prove a Z906 communication fault. */
+        if (!proof_ok) {
+            s_criteria.z906_comm_healthy = false;
+            ota_health_refresh_mask_from_criteria();
+        }
+    }
+    portEXIT_CRITICAL(&s_health_mux);
+    return admitted;
+}
+
 void ota_health_process_cycle(uint32_t elapsed_sec)
 {
     portENTER_CRITICAL(&s_health_mux);
@@ -266,40 +318,51 @@ void ota_health_process_cycle(uint32_t elapsed_sec)
         if (s_before_sdk_handoff_fn_for_test != NULL) {
             s_before_sdk_handoff_fn_for_test();
         }
-        z906_ota_status_snapshot_t last = { 0 };
-        bool last_read = z906_state_get_ota_status_snapshot(&last);
-        int64_t last_now = ota_health_now_us();
-        int64_t last_status = s_status_time_fn_for_test != NULL
-            ? s_status_time_fn_for_test() : last.matched_status_us;
-        bool last_proof_ok = last_read && last.main_valid &&
-            last.cable_epoch == live.cable_epoch &&
-            last.rx_stream_epoch == live.rx_stream_epoch &&
-            last_status > s_validation_start_us &&
-            last_status <= last_now &&
-            (last_now - last_status) <= OTA_Z906_STATUS_MAX_AGE_US;
-
-        /* No OTA/flash/NVS call while holding this short static critical
-         * section; only the software admission/rollback arbitration lives here. */
-        portENTER_CRITICAL(&s_health_mux);
-        bool cancel_commit = !last_proof_ok || s_rollback_requested_during_admission;
-        if (cancel_commit) {
-            s_finalization_in_progress = false;
-            s_rollback_requested_during_admission = false;
-            s_criteria.z906_comm_healthy = false;
-            ota_health_refresh_mask_from_criteria();
-        } else {
-            s_commit_admitted = true;
+        /* 19-K: inject RX loss/manual rollback at the formerly unprotected
+         * last-snapshot -> health-claim boundary before taking the state lock. */
+        if (s_before_atomic_claim_fn_for_test != NULL) {
+            s_before_atomic_claim_fn_for_test();
         }
-        portEXIT_CRITICAL(&s_health_mux);
-        if (cancel_commit) {
-            ota_client_note_health_failure("Final OTA admission revoked by RX loss or rollback");
-            ota_health_trigger_rollback("Rollback request or Z906 proof lost at SDK handoff");
+        ota_atomic_admission_t decision = {
+            .expected_cable_epoch = live.cable_epoch,
+            .expected_rx_epoch = live.rx_stream_epoch,
+            .checked_at_us = ota_health_now_us(),
+            .use_test_status = (s_status_time_fn_for_test != NULL),
+            .test_status_us = s_status_time_fn_for_test != NULL
+                ? s_status_time_fn_for_test() : 0,
+            .evaluated = false,
+            .proof_invalid = true,
+            .rollback_veto = false
+        };
+        bool admitted = z906_state_with_locked_ota_snapshot(
+            ota_health_claim_locked_proof, &decision);
+        if (!admitted) {
+            /* On a missing state service the callback could not clear claim
+             * state. Fail closed; do not infer a physical communication PASS. */
+            if (!decision.evaluated) {
+                portENTER_CRITICAL(&s_health_mux);
+                s_finalization_in_progress = false;
+                s_rollback_requested_during_admission = false;
+                s_criteria.z906_comm_healthy = false;
+                ota_health_refresh_mask_from_criteria();
+                portEXIT_CRITICAL(&s_health_mux);
+            }
+            if (decision.proof_invalid) {
+                ota_client_note_health_failure("Z906 proof lost before atomic OTA admission");
+            } else if (decision.rollback_veto) {
+                ESP_LOGW(TAG, "Operator rollback vetoed OTA admission; Z906 proof remains healthy");
+            }
+            ota_health_trigger_rollback("Rollback veto or Z906 proof invalid before admission");
             return;
         }
 
-        /* Explicit software admission boundary, with no intervening log.
-         * A preemption in the tiny interval to the physical SDK call remains
-         * possible: it is NOT falsely represented as a hardware guarantee. */
+        /* Test-only preemption AFTER successful software admission. A subsequent
+         * rollback is TOO_LATE by the product-approved boundary, even if the
+         * ESP-IDF function has not yet been entered. */
+        if (s_after_atomic_claim_fn_for_test != NULL) {
+            s_after_atomic_claim_fn_for_test();
+        }
+        /* SDK runs outside all locks; no guarantee extends to SDK entry. */
         esp_err_t err = s_mark_valid_fn_for_test != NULL
             ? s_mark_valid_fn_for_test()
             : esp_ota_mark_app_valid_cancel_rollback();
@@ -566,6 +629,16 @@ void ota_health_set_before_sdk_handoff_fn_for_test(ota_health_void_fn_t fn)
     s_before_sdk_handoff_fn_for_test = fn;
 }
 
+void ota_health_set_before_atomic_claim_fn_for_test(ota_health_void_fn_t fn)
+{
+    s_before_atomic_claim_fn_for_test = fn;
+}
+
+void ota_health_set_after_atomic_claim_fn_for_test(ota_health_void_fn_t fn)
+{
+    s_after_atomic_claim_fn_for_test = fn;
+}
+
 void ota_health_set_mark_valid_fn_for_test(ota_mark_valid_fn_t fn)
 {
     s_mark_valid_fn_for_test = fn;
@@ -594,6 +667,8 @@ void ota_health_reset_for_test(void)
     s_mark_valid_fn_for_test = NULL;
     s_before_final_admission_fn_for_test = NULL;
     s_before_sdk_handoff_fn_for_test = NULL;
+    s_before_atomic_claim_fn_for_test = NULL;
+    s_after_atomic_claim_fn_for_test = NULL;
     s_sampled_cable_epoch = 0;
     s_sampled_rx_stream_epoch = 0;
     memset(&s_criteria, 0, sizeof(s_criteria));

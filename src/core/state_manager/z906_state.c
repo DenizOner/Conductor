@@ -756,6 +756,28 @@ bool z906_state_get_ota_status_snapshot(z906_ota_status_snapshot_t *out)
     return true;
 }
 
+bool z906_state_with_locked_ota_snapshot(z906_ota_admission_claim_fn_t claim,
+                                         void *context)
+{
+    if (claim == NULL || s_state_mutex == NULL) {
+        return false;
+    }
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    const z906_ota_status_snapshot_t proof = {
+        .main_valid = s_current_state.main_state_valid &&
+                      s_current_state.cable_connected,
+        .cable_epoch = s_cable_epoch,
+        .rx_stream_epoch = s_amp_rx_stream_epoch,
+        .matched_status_us = (s_current_state.main_state_valid &&
+                              s_current_state.cable_connected)
+            ? s_last_matched_status_time_us : 0
+    };
+    /* Strictly short callback, state->health lock order, no SDK or I/O. */
+    bool claimed = claim(&proof, context);
+    xSemaphoreGive(s_state_mutex);
+    return claimed;
+}
+
 int64_t z906_state_get_matched_status_reply_time_us(void)
 {
     if (s_state_mutex == NULL) {

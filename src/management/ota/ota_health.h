@@ -149,6 +149,10 @@ void ota_health_set_mark_valid_fn_for_test(ota_mark_valid_fn_t fn);
 void ota_health_set_before_final_admission_fn_for_test(ota_health_void_fn_t fn);
 /** @brief Test interleaving after final proof but before SDK handoff claim. */
 void ota_health_set_before_sdk_handoff_fn_for_test(ota_health_void_fn_t fn);
+/** Host/Unity: preempt after earlier RX proof, BEFORE the atomic software claim. */
+void ota_health_set_before_atomic_claim_fn_for_test(ota_health_void_fn_t fn);
+/** Host/Unity: preempt AFTER the atomic claim, before the SDK mock enters. */
+void ota_health_set_after_atomic_claim_fn_for_test(ota_health_void_fn_t fn);
 void ota_health_reset_for_test(void);
 
 #ifdef __cplusplus

@@ -277,6 +277,21 @@ typedef struct {
 bool z906_state_get_ota_status_snapshot(z906_ota_status_snapshot_t *out);
 
 /**
+ * @brief Serialize an OTA software-admission decision with RX proof invalidation.
+ *
+ * The callback receives a coherent snapshot WHILE the existing state mutex is
+ * held. It must only make a short, non-blocking admission decision; it MUST NOT
+ * call any z906_state API, block, log, or invoke SDK/flash/NVS operations.
+ * Lock ordering is state mutex -> short OTA health portMUX; never inverse.
+ * A cable/RX loss before the decision must either run first or wait until the
+ * decision is complete. Loss after the decision cannot revoke OTA admission.
+ */
+typedef bool (*z906_ota_admission_claim_fn_t)(
+    const z906_ota_status_snapshot_t *locked_proof, void *context);
+bool z906_state_with_locked_ota_snapshot(z906_ota_admission_claim_fn_t claim,
+                                         void *context);
+
+/**
  * @brief Callback type for state change observers.
  *
  * Called from within the state mutex immediately after any attribute changes.
