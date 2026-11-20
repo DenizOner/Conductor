@@ -51,6 +51,14 @@ static void advance_health_second(void)
     ota_health_process_cycle(1);
 }
 
+/* Explicitly enter this test's pending client state instead of relying on
+ * static ota_client state retained from the preceding Unity test. */
+static void prime_ota_client_pending_validation(void)
+{
+    ota_client_process_cycle();
+    TEST_ASSERT_EQUAL(OTA_STATE_PENDING_VALIDATION, ota_client_get_state());
+}
+
 static void mock_rollback_fn(const char *reason)
 {
     s_rollback_call_count++;
@@ -79,6 +87,11 @@ static void request_rollback_at_sdk_handoff(void)
 static void request_rollback_after_atomic_claim(void)
 {
     ota_health_trigger_manual_rollback("CLI rollback after software claim before SDK entry");
+}
+static void manual_rollback_then_rx_drop_before_claim(void)
+{
+    ota_health_trigger_manual_rollback("Concurrent CLI rollback before OTA claim");
+    inject_rx_drop_at_final_admission();
 }
 static void expire_status_before_atomic_claim(void)
 {
@@ -159,6 +172,15 @@ void test_ota_result_strings(void)
     TEST_ASSERT_EQUAL_STRING("ROLLBACK_DETECTED", ota_client_result_str(OTA_RESULT_ROLLBACK_DETECTED));
     TEST_ASSERT_EQUAL_STRING("MANUAL_ROLLBACK_REQUESTED", ota_client_result_str(OTA_RESULT_MANUAL_ROLLBACK_REQUESTED));
     TEST_ASSERT_EQUAL_STRING("SDK_MARK_VALID_FAILED", ota_client_result_str(OTA_RESULT_SDK_MARK_VALID_FAILED));
+    /* Append-only OTA diagnostics: previous result identities stay stable. */
+    TEST_ASSERT_EQUAL_INT(0, OTA_RESULT_NONE);
+    TEST_ASSERT_EQUAL_INT(1, OTA_RESULT_SUCCESS);
+    TEST_ASSERT_EQUAL_INT(2, OTA_RESULT_DOWNLOAD_FAILED);
+    TEST_ASSERT_EQUAL_INT(3, OTA_RESULT_VALIDATION_FAILED);
+    TEST_ASSERT_EQUAL_INT(4, OTA_RESULT_INCOMPATIBLE_IMAGE);
+    TEST_ASSERT_EQUAL_INT(5, OTA_RESULT_FLASH_FAILED);
+    TEST_ASSERT_EQUAL_INT(6, OTA_RESULT_HEALTH_CHECK_FAILED);
+    TEST_ASSERT_EQUAL_INT(7, OTA_RESULT_ROLLBACK_DETECTED);
     TEST_ASSERT_EQUAL_INT(8, OTA_RESULT_MANUAL_ROLLBACK_REQUESTED);
     TEST_ASSERT_EQUAL_INT(9, OTA_RESULT_SDK_MARK_VALID_FAILED);
 }
@@ -638,7 +660,9 @@ void test_ota_locked_claim_lease_exactly_five_seconds_passes(void)
     ota_health_set_rollback_fn_for_test(mock_rollback_fn);
     ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
     ota_health_set_pending_verify_for_test(true);
-    s_delay_before_critical_us = 4000000; /* CONFIG t=14, claim t=19. */
+    /* Start t=1; STATUS refreshes at t=2,6,10,14; final cycle is t=16.
+     * An additional 3s gives exactly 5s STATUS age at claim t=19. */
+    s_delay_before_critical_us = 3000000;
     ota_health_set_before_locked_claim_critical_fn_for_test(
         advance_clock_inside_state_mutex_before_critical);
     s_auto_status_refresh = true;
@@ -654,7 +678,8 @@ void test_ota_locked_claim_expired_inside_state_mutex_rejects(void)
     ota_health_set_rollback_fn_for_test(mock_rollback_fn);
     ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
     ota_health_set_pending_verify_for_test(true);
-    s_delay_before_critical_us = 4000001;
+    /* Same STATUS t=14 and claim t=19+1us: exactly 5s+1us is rejected. */
+    s_delay_before_critical_us = 3000001;
     ota_health_set_before_locked_claim_critical_fn_for_test(
         advance_clock_inside_state_mutex_before_critical);
     s_auto_status_refresh = true;
@@ -719,6 +744,7 @@ void test_ota_manual_rollback_result_is_distinct_from_health_failure(void)
 {
     ota_health_set_rollback_fn_for_test(mock_rollback_fn);
     ota_health_set_pending_verify_for_test(true);
+    prime_ota_client_pending_validation();
     ota_health_trigger_manual_rollback("Operator cancelled pending OTA");
     ota_client_process_cycle();
     TEST_ASSERT_TRUE(ota_health_was_manual_only_rollback());
@@ -743,12 +769,35 @@ void test_ota_rollback_during_sdk_is_reported_too_late(void)
                       ota_health_get_recovery_state());
 }
 
+/** @brief A real RX health failure must supersede a simultaneous manual veto. */
+void test_ota_concurrent_manual_and_real_rx_failure_reports_health_failure(void)
+{
+    ota_health_set_rollback_fn_for_test(mock_rollback_fn);
+    ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
+    ota_health_set_pending_verify_for_test(true);
+    prime_ota_client_pending_validation();
+    ota_health_set_before_atomic_claim_fn_for_test(
+        manual_rollback_then_rx_drop_before_claim);
+    s_auto_status_refresh = true;
+    for (int i = 0; i < 15; ++i) advance_health_second();
+    ota_client_process_cycle();
+    TEST_ASSERT_EQUAL_INT(0, s_mark_valid_call_count);
+    TEST_ASSERT_EQUAL_INT(1, s_rollback_call_count);
+    TEST_ASSERT_FALSE(ota_health_was_manual_only_rollback());
+    TEST_ASSERT_EQUAL(OTA_RESULT_HEALTH_CHECK_FAILED, ota_client_get_last_result());
+    TEST_ASSERT_EQUAL(OTA_STATE_FAILED, ota_client_get_state());
+    ota_health_criteria_t criteria = {0};
+    ota_health_get_criteria(&criteria);
+    TEST_ASSERT_FALSE(criteria.z906_comm_healthy);
+}
+
 /** @brief AUD-19K-02: SDK failure beats TOO_LATE manual in client result. */
 void test_ota_sdk_commit_failure_overrides_late_manual_with_fallback(void)
 {
     ota_health_set_rollback_fn_for_test(mock_rollback_fn);
     ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
     ota_health_set_pending_verify_for_test(true);
+    prime_ota_client_pending_validation();
     s_mark_valid_result = ESP_FAIL;
     s_inject_rollback_during_sdk_call = true;
     s_auto_status_refresh = true;
@@ -761,6 +810,7 @@ void test_ota_sdk_commit_failure_overrides_late_manual_with_fallback(void)
     TEST_ASSERT_FALSE(ota_health_was_manual_only_rollback());
     TEST_ASSERT_EQUAL(OTA_HEALTH_RECOVERY_REQUESTED, ota_health_get_recovery_state());
     TEST_ASSERT_EQUAL(OTA_RESULT_SDK_MARK_VALID_FAILED, ota_client_get_last_result());
+    TEST_ASSERT_EQUAL(OTA_STATE_FAILED, ota_client_get_state());
     ota_health_criteria_t criteria = {0};
     ota_health_get_criteria(&criteria);
     TEST_ASSERT_TRUE(criteria.z906_comm_healthy);
@@ -772,6 +822,7 @@ void test_ota_sdk_commit_failure_late_manual_without_fallback(void)
     ota_health_set_rollback_fn_for_test(mock_rollback_fn);
     ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
     ota_health_set_pending_verify_for_test(true);
+    prime_ota_client_pending_validation();
     s_mark_valid_result = ESP_FAIL;
     s_inject_rollback_during_sdk_call = true;
     s_fake_fallback_available = false;
@@ -782,6 +833,7 @@ void test_ota_sdk_commit_failure_late_manual_without_fallback(void)
     TEST_ASSERT_EQUAL_INT(0, s_rollback_call_count);
     TEST_ASSERT_EQUAL(OTA_HEALTH_RECOVERY_NO_FALLBACK, ota_health_get_recovery_state());
     TEST_ASSERT_EQUAL(OTA_RESULT_SDK_MARK_VALID_FAILED, ota_client_get_last_result());
+    TEST_ASSERT_EQUAL(OTA_STATE_FAILED, ota_client_get_state());
 }
 
 /** @brief A successful SDK commit stays valid despite a too-late CLI request. */
@@ -790,6 +842,7 @@ void test_ota_sdk_commit_success_preserves_too_late_diagnostic(void)
     ota_health_set_rollback_fn_for_test(mock_rollback_fn);
     ota_health_set_mark_valid_fn_for_test(mock_mark_valid_ok);
     ota_health_set_pending_verify_for_test(true);
+    prime_ota_client_pending_validation();
     s_inject_rollback_during_sdk_call = true;
     s_auto_status_refresh = true;
     for (int i = 0; i < 15; ++i) advance_health_second();
@@ -798,8 +851,10 @@ void test_ota_sdk_commit_success_preserves_too_late_diagnostic(void)
     TEST_ASSERT_TRUE(ota_health_is_validated());
     TEST_ASSERT_FALSE(ota_health_was_sdk_mark_valid_failed());
     TEST_ASSERT_EQUAL(OTA_HEALTH_RECOVERY_REQUEST_TOO_LATE, ota_health_get_recovery_state());
-    /* ota_client has its own lifetime; do not infer a fresh SUCCESS result
-     * from a test run that intentionally did not reinitialize that client. */
+    TEST_ASSERT_EQUAL(OTA_STATE_SUCCESS, ota_client_get_state());
+    TEST_ASSERT_EQUAL_INT(0, s_rollback_call_count);
+    /* The current client only updates last_result on failure; testing a
+     * fresh SUCCESS result needs an explicit production-client contract. */
 }
 
 int runUnityTests(void)
@@ -839,6 +894,7 @@ int runUnityTests(void)
     RUN_TEST(test_ota_manual_rollback_after_atomic_claim_is_too_late);
     RUN_TEST(test_ota_manual_rollback_result_is_distinct_from_health_failure);
     RUN_TEST(test_ota_rollback_during_sdk_is_reported_too_late);
+    RUN_TEST(test_ota_concurrent_manual_and_real_rx_failure_reports_health_failure);
     RUN_TEST(test_ota_sdk_commit_failure_overrides_late_manual_with_fallback);
     RUN_TEST(test_ota_sdk_commit_failure_late_manual_without_fallback);
     RUN_TEST(test_ota_sdk_commit_success_preserves_too_late_diagnostic);
