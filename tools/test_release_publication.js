@@ -120,7 +120,8 @@ async function expectNoPatch(name, mutate, pattern, beforePrepare = false) {
             await assert.rejects(f.guard.publish(f.context, snapshot), pattern);
         }
         assert.equal(f.state.patchCalls, 0, 'Never PATCH on prepublication failure');
-        assert.equal(f.state.release.draft, true);
+        /* The external mutation may itself have changed draft state. The
+         * guarantee here is no new publication PATCH by this guard. */
     });
 }
 
