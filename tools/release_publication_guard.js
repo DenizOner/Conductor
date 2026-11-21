@@ -275,7 +275,13 @@ function createGuard(api, verifyAssets = verifyReleaseAssets,
             requireValid(snapshot.releaseId === id &&
                 same(snapshot.assets, [...expected].sort((a, b) => a.name.localeCompare(b.name))),
             'Created draft snapshot differs from verified uploaded asset identities');
-            await assertLiveTag(api, ctx);
+            try {
+                await assertLiveTag(api, ctx);
+            } catch (err) {
+                throw new Error('ASSET_UPLOAD_OUTCOME_UNKNOWN: final tag readback failed; ' +
+                    'remote draft/assets may exist; inspect GitHub manually, ' +
+                    'do not retry/delete/rollback: ' + err.message);
+            }
             return snapshot;
         },
         async prepare(ctx) {
@@ -426,6 +432,21 @@ const ghApi = {
     }
 };
 
+/* A local snapshot write failure cannot undo a staged remote draft.
+ * Read-only prepare retains its original file-write error contract. */
+function persistSnapshot(snapshotFile, snapshot, mode, writeFile = fs.writeFileSync) {
+    try {
+        writeFile(snapshotFile, JSON.stringify(snapshot, null, 2) + '\n', { flag: 'wx' });
+    } catch (err) {
+        if (mode === 'stage') {
+            throw new Error('ASSET_UPLOAD_OUTCOME_UNKNOWN: snapshot write failed; ' +
+                'remote draft/four assets may exist; inspect GitHub manually, ' +
+                'do not retry/delete/rollback: ' + err.message);
+        }
+        throw err;
+    }
+}
+
 async function main() {
     const [mode, directory, repository, tag, commit, snapshotFile] = process.argv.slice(2);
     if (mode === 'absent') {
@@ -449,7 +470,7 @@ async function main() {
         /* Refuse an existing snapshot BEFORE any create-only POST. */
         requireValid(!fs.existsSync(snapshotFile), 'Snapshot already exists; no create/retry');
         const snapshot = mode === 'stage' ? await guard.stage(ctx) : await guard.prepare(ctx);
-        fs.writeFileSync(snapshotFile, JSON.stringify(snapshot, null, 2) + '\n', { flag: 'wx' });
+        persistSnapshot(snapshotFile, snapshot, mode);
         console.log('[PASS] Newly staged DRAFT Release ID and 4 exact asset identities; not public');
     } else {
         const snapshot = JSON.parse(fs.readFileSync(snapshotFile, 'utf8'));
@@ -466,4 +487,4 @@ if (require.main === module) {
 }
 module.exports = { createGuard, validateContext, captureDraft, compareReleaseToSnapshot,
     assertLiveTag, lookupReleaseByGraphql, uploadEndpoint, assertCreatedDraft,
-    requirePatchedGh, attestationArgs, verifyAttestations };
+    requirePatchedGh, attestationArgs, verifyAttestations, persistSnapshot };

@@ -10,7 +10,7 @@ const crypto = require('node:crypto');
 const path = require('node:path');
 const {
     createGuard, requirePatchedGh, attestationArgs, verifyAttestations,
-    uploadEndpoint
+    uploadEndpoint, persistSnapshot
 } = require('./release_publication_guard.js');
 
 const REPO = 'DenizOner/Conductor';
@@ -41,7 +41,8 @@ function make() {
         createCalls: 0, uploadCalls: 0, createFailure: null,
         uploadFailure: null, afterCreateMutation: null, afterUploadMutation: null,
         createResponseOverride: null, uploadResponseOverride: null,
-        foreignRelease: null, graphqlPickForeign: false, graphqlLagCount: 0
+        foreignRelease: null, graphqlPickForeign: false, graphqlLagCount: 0,
+        finalTagFailure: null, tagReadsAfterFour: 0
     };
     state.release = {
         id: 12345, tag_name: TAG, draft: true,
@@ -53,6 +54,14 @@ function make() {
 
     const api = {
         async get(route) {
+            if (route === 'repos/' + REPO + '/git/ref/tags/' + TAG &&
+                state.uploadCalls === NAMES.length) {
+                state.tagReadsAfterFour++;
+                /* Two guarded reads after upload four precede final tag readback. */
+                if (state.finalTagFailure && state.tagReadsAfterFour === 3) {
+                    throw new Error(state.finalTagFailure);
+                }
+            }
             if (state.getFailure && route.includes(state.getFailure.route)) {
                 throw new Error(state.getFailure.message);
             }
@@ -313,6 +322,45 @@ async function main() {
         assert.equal(f.state.uploadCalls, 2);
         assert.equal(f.state.release.assets.length, 2);
         assert.equal(f.state.patchCalls, 0);
+    });
+    for (const status of [429, 500]) {
+        await test('P20-S2d: final tag HTTP ' + status +
+            ' after four uploads => ASSET UNKNOWN, zero PATCH', async () => {
+            const f = make();
+            f.state.graphqlNull = true;
+            f.state.finalTagFailure = 'HTTP ' + status;
+            await assert.rejects(f.guard.stage(f.context),
+                new RegExp('ASSET_UPLOAD_OUTCOME_UNKNOWN: final tag readback failed;.*HTTP ' +
+                    status));
+            assert.equal(f.state.tagReadsAfterFour, 3);
+            assert.equal(f.state.createCalls, 1);
+            assert.equal(f.state.uploadCalls, 4);
+            assert.equal(f.state.release.assets.length, 4);
+            assert.equal(f.state.patchCalls, 0);
+        });
+    }
+    await test('P20-S2d: snapshot write failure after four uploads => ASSET UNKNOWN', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        const snapshot = await f.guard.stage(f.context);
+        let writeCalls = 0;
+        assert.throws(() => persistSnapshot('snapshot.json', snapshot, 'stage',
+            (file, contents, options) => {
+                writeCalls++;
+                assert.equal(file, 'snapshot.json');
+                assert.equal(JSON.parse(contents).releaseId, snapshot.releaseId);
+                assert.equal(options.flag, 'wx');
+                throw new Error('ENOSPC');
+            }), /ASSET_UPLOAD_OUTCOME_UNKNOWN: snapshot write failed;.*ENOSPC/);
+        assert.equal(writeCalls, 1);
+        assert.equal(f.state.createCalls, 1);
+        assert.equal(f.state.uploadCalls, 4);
+        assert.equal(f.state.release.assets.length, 4);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('P20-S2d: prepare snapshot failure retains original error', () => {
+        assert.throws(() => persistSnapshot('snapshot.json', { releaseId: 12345 },
+            'prepare', () => { throw new Error('EACCES'); }), /EACCES/);
     });
     await test('P20-S2b: create-only stage uploads exactly four files to NEW numeric ID', async () => {
         const f = make();
