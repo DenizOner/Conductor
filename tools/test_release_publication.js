@@ -40,7 +40,8 @@ function make() {
         graphqlResponse: null, graphqlCalls: 0, restTagCalls: 0,
         createCalls: 0, uploadCalls: 0, createFailure: null,
         uploadFailure: null, afterCreateMutation: null, afterUploadMutation: null,
-        createResponseOverride: null, uploadResponseOverride: null
+        createResponseOverride: null, uploadResponseOverride: null,
+        foreignRelease: null, graphqlPickForeign: false, graphqlLagCount: 0
     };
     state.release = {
         id: 12345, tag_name: TAG, draft: true,
@@ -86,11 +87,16 @@ function make() {
             if (state.graphqlResponse) return clone(state.graphqlResponse);
             assert.equal(repository, REPO);
             assert.equal(tag, TAG);
-            const release = (state.graphqlNull || state.release.tag_name !== tag) ?
+            if (state.graphqlLagCount > 0) {
+                state.graphqlLagCount--;
+                return { data: { repository: { release: null } } };
+            }
+            const selected = state.graphqlPickForeign ? state.foreignRelease : state.release;
+            const release = (state.graphqlNull || !selected || selected.tag_name !== tag) ?
                 null : {
-                    databaseId: state.releaseId,
-                    isDraft: state.release.draft,
-                    tagName: state.release.tag_name
+                    databaseId: state.graphqlPickForeign ? selected.id : state.releaseId,
+                    isDraft: selected.draft,
+                    tagName: selected.tag_name
                 };
             return { data: { repository: { release } } };
         },
@@ -101,15 +107,29 @@ function make() {
             assert.equal(body.target_commitish, COMMIT);
             assert.equal(body.draft, true);
             assert.equal(body.prerelease, false);
-            if (state.createFailure === 'collision-draft' ||
-                state.createFailure === 'collision-public') {
+            const collision = state.createFailure &&
+                /^(collision-(draft|public)|collision-409-(draft|public))$/.test(state.createFailure);
+            if (collision) {
                 state.graphqlNull = false;
-                state.release.draft = state.createFailure === 'collision-draft';
-                throw new Error('HTTP 422: Release already exists');
+                state.release.draft = state.createFailure.endsWith('draft');
+                const status = state.createFailure.includes('409') ? 409 : 422;
+                throw new Error('HTTP ' + status + ': Release already exists');
             }
             if (state.createFailure === 'before') throw new Error('HTTP 429');
             state.graphqlNull = false;
             state.release = { id: state.releaseId, tag_name: TAG, draft: true, assets: [] };
+            if (state.createFailure === 'duplicate-201-foreign' ||
+                state.createFailure === 'duplicate-201-own') {
+                /* Simulated server alternative: concurrent draft X and new Y
+                 * can exist; which one GraphQL selects is NOT guaranteed. */
+                state.foreignRelease = {
+                    id: 55555, tag_name: TAG, draft: true,
+                    assets: [{ id: 67890, name: 'foreign.bin', size: 16,
+                        state: 'uploaded', digest: 'sha256:' + '1'.repeat(64) }]
+                };
+                state.graphqlPickForeign = state.createFailure === 'duplicate-201-foreign';
+            }
+            if (state.createFailure === 'delayed-graphql') state.graphqlLagCount = 1;
             const createdResponse = clone(state.release);
             if (state.afterCreateMutation) state.afterCreateMutation(state);
             if (state.createFailure === 'after') throw new Error('Remote connection lost');
@@ -186,6 +206,114 @@ async function expectNoPatch(name, mutate, pattern, beforePrepare = false) {
 }
 
 async function main() {
+    await test('P20-S2c: concurrent existing DRAFT + HTTP 409 => UNKNOWN and zero uploads', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        f.state.createFailure = 'collision-409-draft';
+        await assert.rejects(f.guard.stage(f.context),
+            /CREATE_OUTCOME_UNKNOWN:.*HTTP 409: Release already exists/);
+        assert.equal(f.state.createCalls, 1);
+        assert.equal(f.state.uploadCalls, 0);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('P20-S2c: concurrent existing PUBLIC + HTTP 409 => UNKNOWN and zero uploads', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        f.state.createFailure = 'collision-409-public';
+        await assert.rejects(f.guard.stage(f.context),
+            /CREATE_OUTCOME_UNKNOWN:.*HTTP 409: Release already exists/);
+        assert.equal(f.state.createCalls, 1);
+        assert.equal(f.state.uploadCalls, 0);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('P20-S2c: duplicate HTTP 201, GraphQL selects foreign draft X; reject Y', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        f.state.createFailure = 'duplicate-201-foreign';
+        await assert.rejects(f.guard.stage(f.context),
+            /CREATE_OUTCOME_UNKNOWN:.*Created draft GraphQL ID\/state mismatch/);
+        assert.equal(f.state.createCalls, 1);
+        assert.equal(f.state.uploadCalls, 0);
+        assert.equal(f.state.patchCalls, 0);
+        assert.equal(f.state.foreignRelease.id, 55555);
+        assert.deepEqual(f.state.foreignRelease.assets.map(a => a.name), ['foreign.bin']);
+        assert.equal(f.state.release.id, 12345);
+        assert.deepEqual(f.state.release.assets, []);
+    });
+    await test('P20-S2c: duplicate HTTP 201, GraphQL selects own Y; X remains untouched', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        f.state.createFailure = 'duplicate-201-own';
+        const snapshot = await f.guard.stage(f.context);
+        assert.equal(snapshot.releaseId, 12345);
+        assert.equal(f.state.createCalls, 1);
+        assert.equal(f.state.uploadCalls, 4);
+        assert.equal(f.state.patchCalls, 0);
+        assert.equal(f.state.foreignRelease.id, 55555);
+        assert.deepEqual(f.state.foreignRelease.assets.map(a => a.name), ['foreign.bin']);
+        /* This hypothetical server behavior is NOT a uniqueness proof:
+         * GraphQL selected Y despite an existing same-tag draft X. */
+    });
+    await test('P20-S2c: HTTP 201 but delayed GraphQL discovery => CREATE UNKNOWN', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        f.state.createFailure = 'delayed-graphql';
+        await assert.rejects(f.guard.stage(f.context),
+            /CREATE_OUTCOME_UNKNOWN:.*Created draft GraphQL ID\/state mismatch/);
+        assert.equal(f.state.createCalls, 1);
+        assert.equal(f.state.uploadCalls, 0);
+        assert.equal(f.state.patchCalls, 0);
+        assert.equal(f.state.release.id, 12345);
+    });
+    await test('P20-S2c: POST 201 then numeric REST GET 500 => CREATE UNKNOWN', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        f.state.afterCreateMutation = state => {
+            state.getFailure = { route: '/releases/12345', message: 'HTTP 500' };
+        };
+        await assert.rejects(f.guard.stage(f.context),
+            /CREATE_OUTCOME_UNKNOWN: post-create draft\/asset readback failed;.*HTTP 500/);
+        assert.equal(f.state.createCalls, 1);
+        assert.equal(f.state.uploadCalls, 0);
+        assert.equal(f.state.patchCalls, 0);
+        assert.equal(f.state.release.draft, true);
+    });
+    await test('P20-S2c: POST 201 then GraphQL HTTP 429 => CREATE UNKNOWN', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        f.state.afterCreateMutation = state => { state.graphqlFailure = 'HTTP 429'; };
+        await assert.rejects(f.guard.stage(f.context),
+            /CREATE_OUTCOME_UNKNOWN: post-create draft\/asset readback failed;.*HTTP 429/);
+        assert.equal(f.state.createCalls, 1);
+        assert.equal(f.state.uploadCalls, 0);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('P20-S2c: asset uploaded then numeric REST GET 500 => ASSET UNKNOWN', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        f.state.afterUploadMutation = state => {
+            state.getFailure = { route: '/releases/12345', message: 'HTTP 500' };
+        };
+        await assert.rejects(f.guard.stage(f.context),
+            /ASSET_UPLOAD_OUTCOME_UNKNOWN: post-create draft\/asset readback failed;.*HTTP 500/);
+        assert.equal(f.state.createCalls, 1);
+        assert.equal(f.state.uploadCalls, 1);
+        assert.equal(f.state.release.assets.length, 1);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('P20-S2c: second uploaded asset then GraphQL HTTP 429 => ASSET UNKNOWN', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        f.state.afterUploadMutation = state => {
+            if (state.uploadCalls === 2) state.graphqlFailure = 'HTTP 429';
+        };
+        await assert.rejects(f.guard.stage(f.context),
+            /ASSET_UPLOAD_OUTCOME_UNKNOWN: post-create draft\/asset readback failed;.*HTTP 429/);
+        assert.equal(f.state.createCalls, 1);
+        assert.equal(f.state.uploadCalls, 2);
+        assert.equal(f.state.release.assets.length, 2);
+        assert.equal(f.state.patchCalls, 0);
+    });
     await test('P20-S2b: create-only stage uploads exactly four files to NEW numeric ID', async () => {
         const f = make();
         f.state.graphqlNull = true;

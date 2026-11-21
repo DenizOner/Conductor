@@ -224,18 +224,34 @@ function createGuard(api, verifyAssets = verifyReleaseAssets,
                 assertCreatedDraft(live, ctx, id, expected);
                 return live;
             };
-            await check();
+            /* After a successful create response, even a readback failure can
+             * leave a real remote draft or uploaded asset behind. Diagnose the
+             * remote outcome as UNKNOWN, without attempting recovery/retry. */
+            let uploadAttempted = false;
+            const checked = async () => {
+                try {
+                    return await check();
+                } catch (err) {
+                    const kind = uploadAttempted ?
+                        'ASSET_UPLOAD_OUTCOME_UNKNOWN' : 'CREATE_OUTCOME_UNKNOWN';
+                    throw new Error(kind + ': post-create draft/asset readback failed; ' +
+                        'remote Release/assets may exist; inspect GitHub manually, ' +
+                        'do not retry/delete/rollback: ' + err.message);
+                }
+            };
+            await checked();
             for (const file of verified) {
                 requireValid(NAMES.includes(file.name) && typeof file.sha256 === 'string' &&
                     /^[0-9a-f]{64}$/.test(file.sha256) && file.size > 0,
                 'Malformed local asset evidence');
-                await check(); // explicit numerical-ID + zero-unexpected-assets guard
+                await checked(); // numeric-ID and unexpected-assets guard, no auto retry
                 const localPath = path.join(ctx.directory, file.name);
                 const data = readAsset(localPath);
                 requireValid(data.length === file.size &&
                     crypto.createHash('sha256').update(data).digest('hex') === file.sha256,
                 'Local release asset changed since verification');
                 let uploaded;
+                uploadAttempted = true;
                 try {
                     uploaded = await api.upload(uploadEndpoint(ctx, id, file.name), localPath);
                 } catch (err) {
@@ -252,9 +268,9 @@ function createGuard(api, verifyAssets = verifyReleaseAssets,
                     id: uploaded.id, name: uploaded.name,
                     size: uploaded.size, digest: uploaded.digest
                 });
-                await check();
+                await checked();
             }
-            const final = await check();
+            const final = await checked();
             const snapshot = captureDraft(final, ctx, verifyAssets);
             requireValid(snapshot.releaseId === id &&
                 same(snapshot.assets, [...expected].sort((a, b) => a.name.localeCompare(b.name))),
