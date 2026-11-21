@@ -149,9 +149,7 @@ jobs:
         run: |
           set -euo pipefail
           node tools/verify_release_assets.js dist/release "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
-          for file in firmware.bin 1000-0906-010400aa-LogitechZ906.ota index.json conductor_converter.mjs; do
-            gh attestation verify "dist/release/$file" --repo "$GITHUB_REPOSITORY"
-          done
+          node tools/release_publication_guard.js attest dist/release "$GITHUB_REPOSITORY" "$GITHUB_REF" "$GITHUB_SHA" release_ota.yml
 
       - name: Refuse To Overwrite an Existing Release
         env:
@@ -186,21 +184,18 @@ jobs:
             dist/release/index.json
             dist/release/conductor_converter.mjs
 
-      - name: Verify DRAFT Release Contains All Four Exact Artifacts
+      - name: Pin DRAFT Release ID, Tag Commit and Four Asset IDs/Digests
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" > "$RUNNER_TEMP/conductor-draft-release.json"
-          node tools/verify_release_assets.js dist/release "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$RUNNER_TEMP/conductor-draft-release.json"
+          node tools/release_publication_guard.js prepare dist/release "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA" "$RUNNER_TEMP/conductor-release-snapshot.json"
 
-      - name: Publish Only the Fully Verified DRAFT Release
+      - name: Recheck Pinned DRAFT and Publish Only by Exact Release ID
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          gh release edit "$GITHUB_REF_NAME" --draft=false
-          state="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft')"
-          test "$state" = "false"
+          node tools/release_publication_guard.js publish dist/release "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA" "$RUNNER_TEMP/conductor-release-snapshot.json"
