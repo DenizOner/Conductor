@@ -151,24 +151,13 @@ jobs:
           node tools/verify_release_assets.js dist/release "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
           node tools/release_publication_guard.js attest dist/release "$GITHUB_REPOSITORY" "$GITHUB_REF" "$GITHUB_SHA" release_ota.yml
 
-      - name: Refuse To Overwrite an Existing Release
+      - name: Refuse Existing DRAFT or Published Release (GraphQL)
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          set +e
-          result="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" 2>&1)"
-          status=$?
-          set -e
-          if [[ "$status" == "0" ]]; then
-            echo "::error::Release already exists; refusing modification or publication"
-            exit 1
-          fi
-          if [[ "$result" != *"(HTTP 404)"* ]]; then
-            echo "::error::Cannot confirm release is absent; refusing publication"
-            exit 1
-          fi
+          node tools/release_publication_guard.js absent "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
 
       - name: Create DRAFT GitHub Release and Upload Verified Artifacts
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4

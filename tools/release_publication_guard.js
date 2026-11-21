@@ -10,6 +10,7 @@
  * privileged writer can mutate the draft between GET and PATCH.
  *
  * Usage:
+ * node tools/release_publication_guard.js absent <owner/repo> <tag>
  * node tools/release_publication_guard.js prepare <dir> <owner/repo> <tag> <40hex-commit> <snapshot-json>
  * node tools/release_publication_guard.js publish <dir> <owner/repo> <tag> <40hex-commit> <snapshot-json>
  */
@@ -29,11 +30,15 @@ function same(a, b) {
 function pathFor(ctx, suffix) {
     return 'repos/' + ctx.repository + '/' + suffix;
 }
-function validateContext(ctx) {
+function validateRepositoryTag(ctx) {
     requireValid(ctx && typeof ctx === 'object' &&
         /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(ctx.repository) &&
-        /^v[0-9]+\.[0-9]+\.[0-9]+$/.test(ctx.tag) &&
-        /^[0-9a-f]{40}$/.test(ctx.commit) &&
+        /^v[0-9]+\.[0-9]+\.[0-9]+$/.test(ctx.tag),
+    'Invalid release repository or tag');
+}
+function validateContext(ctx) {
+    validateRepositoryTag(ctx);
+    requireValid(/^[0-9a-f]{40}$/.test(ctx.commit) &&
         typeof ctx.directory === 'string' && ctx.directory.length > 0,
     'Invalid release context');
 }
@@ -101,26 +106,54 @@ function compareReleaseToSnapshot(release, snapshot, expectedDraft) {
     'Release asset ID/name/size/SHA-256 changed since verification');
 }
 
+/* GitHub REST releases/tags/<tag> returns PUBLISHED releases, not drafts.
+ * GitHub CLI discovers drafts with GraphQL repository.release(tagName) and
+ * then fetches their canonical data using GET releases/<databaseId>. */
+async function lookupReleaseByGraphql(api, ctx) {
+    validateRepositoryTag(ctx);
+    const response = await api.graphql(ctx.repository, ctx.tag);
+    requireValid(response && typeof response === 'object' &&
+        (!Object.hasOwn(response, 'errors') ||
+            (Array.isArray(response.errors) && response.errors.length === 0)) &&
+        response.data && response.data.repository &&
+        Object.hasOwn(response.data.repository, 'release'),
+    'GraphQL release lookup incomplete or failed');
+    const item = response.data.repository.release;
+    if (item === null) return null;
+    requireValid(item && positiveId(item.databaseId) &&
+        typeof item.isDraft === 'boolean' && item.tagName === ctx.tag,
+    'GraphQL release identity malformed or ambiguous');
+    return { id: item.databaseId, draft: item.isDraft, tag: item.tagName };
+}
+
 async function readDraft(api, ctx) {
-    const byTag = await api.get(pathFor(ctx, 'releases/tags/' + encodeURIComponent(ctx.tag)));
-    requireValid(byTag && positiveId(byTag.id) && byTag.draft === true,
-        'No unambiguous draft Release for tag');
-    const byId = await api.get(pathFor(ctx, 'releases/' + byTag.id));
-    requireValid(byId && byId.id === byTag.id && byId.draft === true,
-        'Draft Release ID lookup inconsistent');
-    return { byTag, byId };
+    const graph = await lookupReleaseByGraphql(api, ctx);
+    requireValid(graph && graph.draft === true, 'No unambiguous draft Release for tag');
+    const byId = await api.get(pathFor(ctx, 'releases/' + graph.id));
+    requireValid(byId && byId.id === graph.id && byId.draft === true &&
+        byId.tag_name === graph.tag, 'Draft Release ID lookup inconsistent');
+    return { graph, byId };
 }
 
 function createGuard(api, verifyAssets = verifyReleaseAssets) {
     requireValid(api && typeof api.get === 'function' &&
-        typeof api.patch === 'function', 'Missing GitHub API adapter');
+        typeof api.graphql === 'function' && typeof api.patch === 'function',
+        'Missing GitHub API adapter');
     return {
+        async absent(ctx) {
+            validateRepositoryTag(ctx);
+            const found = await lookupReleaseByGraphql(api, ctx);
+            requireValid(found === null,
+                'Release already exists (draft or published); refusing overwrite');
+            return true;
+        },
         async prepare(ctx) {
             validateContext(ctx);
             await assertLiveTag(api, ctx);
             const release = await readDraft(api, ctx);
             const snapshot = captureDraft(release.byId, ctx, verifyAssets);
-            compareReleaseToSnapshot(release.byTag, snapshot, true);
+            requireValid(release.graph.id === snapshot.releaseId && release.graph.tag === snapshot.tag,
+                'Draft GraphQL identity changed since verification');
             await assertLiveTag(api, ctx);
             return snapshot;
         },
@@ -138,7 +171,10 @@ function createGuard(api, verifyAssets = verifyReleaseAssets) {
             const verifiedNow = captureDraft(current.byId, ctx, verifyAssets);
             requireValid(same(verifiedNow, snapshot),
                 'Draft Release or asset identity changed since prepared snapshot');
-            compareReleaseToSnapshot(current.byTag, snapshot, true);
+            compareReleaseToSnapshot(current.byId, snapshot, true);
+            requireValid(current.graph.id === snapshot.releaseId &&
+                current.graph.tag === snapshot.tag && current.graph.draft === true,
+                'Draft GraphQL identity changed since verification');
             await assertLiveTag(api, ctx);
 
             /* LAST mutation: ID-bound PATCH; never PATCH by tag or name. The
@@ -155,9 +191,14 @@ function createGuard(api, verifyAssets = verifyReleaseAssets) {
                 compareReleaseToSnapshot(result, snapshot, false);
                 const live = await api.get(url);
                 compareReleaseToSnapshot(live, snapshot, false);
-                const byTag = await api.get(pathFor(ctx, 'releases/tags/' +
+                const graph = await lookupReleaseByGraphql(api, ctx);
+                requireValid(graph && graph.id === snapshot.releaseId &&
+                    graph.tag === snapshot.tag && graph.draft === false,
+                    'Published GraphQL Release identity mismatch');
+                /* REST by-tag is appropriate ONLY once the release is public. */
+                const published = await api.get(pathFor(ctx, 'releases/tags/' +
                     encodeURIComponent(ctx.tag)));
-                compareReleaseToSnapshot(byTag, snapshot, false);
+                compareReleaseToSnapshot(published, snapshot, false);
                 await assertLiveTag(api, ctx);
             } catch (err) {
                 throw new Error('PUBLICATION_OUTCOME_UNKNOWN: Release may already be public; ' +
@@ -171,11 +212,17 @@ function createGuard(api, verifyAssets = verifyReleaseAssets) {
 /* gh before v2.102.0 had source-ref case-folding and signer-workflow prefix
  * policy defects. Do not use an affected binary to authorize release assets. */
 function requirePatchedGh(versionText) {
-    const match = /^gh version ([0-9]+)\.([0-9]+)\.([0-9]+)/m.exec(versionText);
-    requireValid(match, 'Cannot determine GitHub CLI security patch version');
+    requireValid(typeof versionText === 'string', 'Cannot determine GitHub CLI security patch version');
+    const firstLine = versionText.split(/\r?\n/, 1)[0].trim();
+    /* Match the FULL stable version token. Pre-releases (including 2.102.0-rc.1)
+     * must not inherit the stable release's security-patch guarantee. */
+    const match = /^gh version ([0-9]+)\.([0-9]+)\.([0-9]+)(?: \([0-9]{4}-[0-9]{2}-[0-9]{2}\))?$/.exec(firstLine);
+    requireValid(match, 'Cannot determine stable GitHub CLI security patch version');
     const parts = match.slice(1).map(Number);
-    requireValid(parts[0] > 2 || (parts[0] === 2 && parts[1] >= 102),
-        'GitHub CLI 2.102.0+ required for provenance policy checks');
+    requireValid(parts.every(Number.isSafeInteger), 'Invalid GitHub CLI version number');
+    requireValid(parts[0] > 2 || (parts[0] === 2 &&
+        (parts[1] > 102 || (parts[1] === 102 && parts[2] >= 0))),
+    'GitHub CLI 2.102.0+ required for provenance policy checks');
 }
 
 function attestationArgs(directory, repository, ref, commit, workflow) {
@@ -218,8 +265,17 @@ function ghJson(args) {
         'GitHub API failed (' + result.status + '): ' + (result.stderr || '').slice(0, 500));
     return JSON.parse(result.stdout);
 }
+const RELEASE_QUERY = 'query($owner: String!, $name: String!, $tagName: String!) ' +
+    '{ repository(owner: $owner, name: $name) ' +
+    '{ release(tagName: $tagName) { databaseId isDraft tagName } } }';
 const ghApi = {
     get: endpoint => Promise.resolve(ghJson(['api', endpoint])),
+    graphql: (repository, tag) => {
+        const [owner, name] = repository.split('/');
+        return Promise.resolve(ghJson(['api', 'graphql',
+            '-f', 'query=' + RELEASE_QUERY,
+            '-f', 'owner=' + owner, '-f', 'name=' + name, '-f', 'tagName=' + tag]));
+    },
     patch: (endpoint, body) => {
         requireValid(body && body.draft === false, 'Only draft=false publication is supported');
         return Promise.resolve(ghJson(['api', '-X', 'PATCH', endpoint, '-F', 'draft=false']));
@@ -228,6 +284,12 @@ const ghApi = {
 
 async function main() {
     const [mode, directory, repository, tag, commit, snapshotFile] = process.argv.slice(2);
+    if (mode === 'absent') {
+        const guard = createGuard(ghApi);
+        await guard.absent({ repository: directory, tag: repository });
+        console.log('[PASS] No existing draft or published Release for tag');
+        return;
+    }
     if (mode === 'attest') {
         const [ref, sourceCommit, signerWorkflow] = [tag, commit, snapshotFile];
         const verified = verifyAttestations(directory, repository, ref,
@@ -257,4 +319,5 @@ if (require.main === module) {
     });
 }
 module.exports = { createGuard, validateContext, captureDraft, compareReleaseToSnapshot,
-    assertLiveTag, requirePatchedGh, attestationArgs, verifyAttestations };
+    assertLiveTag, lookupReleaseByGraphql, requirePatchedGh, attestationArgs,
+    verifyAttestations };

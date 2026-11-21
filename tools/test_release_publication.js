@@ -31,7 +31,8 @@ function make() {
         tagCommit: COMMIT, annotated: false, draft: true,
         releaseId: 12345, patchCalls: 0, patchPath: null, patchPayload: null,
         getFailure: null, patchFailure: null, afterPublishReadFailure: null,
-        afterPatchMutate: null
+        afterPatchMutate: null, graphqlFailure: null, graphqlNull: false,
+        graphqlResponse: null, graphqlCalls: 0, restTagCalls: 0
     };
     state.release = {
         id: 12345, tag_name: TAG, draft: true,
@@ -60,11 +61,30 @@ function make() {
             if (route === 'repos/' + REPO + '/git/tags/' + 'c'.repeat(40)) {
                 return { object: { type: 'commit', sha: state.tagCommit } };
             }
-            if (route === 'repos/' + REPO + '/releases/tags/' + TAG ||
-                route === 'repos/' + REPO + '/releases/' + state.releaseId) {
+            if (route === 'repos/' + REPO + '/releases/tags/' + TAG) {
+                state.restTagCalls++;
+                /* Real GitHub REST by-tag endpoint exposes PUBLISHED only. */
+                if (state.release.draft) throw new Error('HTTP 404: ' + route);
+                return clone(state.release);
+            }
+            if (route === 'repos/' + REPO + '/releases/' + state.releaseId) {
                 return clone(state.release);
             }
             throw new Error('HTTP 404: ' + route);
+        },
+        async graphql(repository, tag) {
+            state.graphqlCalls++;
+            if (state.graphqlFailure) throw new Error(state.graphqlFailure);
+            if (state.graphqlResponse) return clone(state.graphqlResponse);
+            assert.equal(repository, REPO);
+            assert.equal(tag, TAG);
+            const release = (state.graphqlNull || state.release.tag_name !== tag) ?
+                null : {
+                    databaseId: state.releaseId,
+                    isDraft: state.release.draft,
+                    tagName: state.release.tag_name
+                };
+            return { data: { repository: { release } } };
         },
         async patch(route, body) {
             state.patchCalls++;
@@ -84,23 +104,10 @@ function make() {
         }
     };
 
-    /* Real production calls verifyReleaseAssets; this mock exercises the
-     * orchestrator's independent asset-ID/source-SHA/state invariants. */
-    const verifyAssets = (dir, repo, tag, release) => {
-        assert.equal(dir, context.directory);
-        assert.equal(repo, REPO);
-        assert.equal(tag, TAG);
-        assert.equal(release.draft, true);
-        assert.equal(release.assets.length, VERIFIED.length);
-        for (const file of VERIFIED) {
-            const asset = release.assets.find(x => x.name === file.name);
-            assert.ok(asset, 'Missing ' + file.name);
-            assert.equal(asset.size, file.size);
-            assert.equal(asset.digest, 'sha256:' + file.sha256);
-            assert.equal(asset.state, 'uploaded');
-        }
-        return clone(VERIFIED);
-    };
+    /* Deliberately return canonical expected files WITHOUT assertions.
+     * The production publication guard must detect remote digest/size errors
+     * itself. A mock AssertionError must never masquerade as a security PASS. */
+    const verifyAssets = () => clone(VERIFIED);
     return { context, state, api, guard: createGuard(api, verifyAssets) };
 }
 async function test(name, run) {
@@ -126,6 +133,110 @@ async function expectNoPatch(name, mutate, pattern, beforePrepare = false) {
 }
 
 async function main() {
+    await test('draft REST-by-tag 404; GraphQL plus numeric ID prepare succeeds', async () => {
+        const f = make();
+        await assert.rejects(f.api.get('repos/' + REPO + '/releases/tags/' + TAG), /HTTP 404/);
+        const snapshot = await f.guard.prepare(f.context);
+        assert.equal(snapshot.releaseId, 12345);
+        assert.equal(f.state.patchCalls, 0);
+        assert.equal(f.state.restTagCalls, 1); // Only the test's explicit probe.
+        assert.ok(f.state.graphqlCalls >= 1);
+    });
+    await test('no Release: GraphQL absence preflight PASS without mutation', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        assert.equal(await f.guard.absent({ repository: REPO, tag: TAG }), true);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('existing DRAFT blocks release creation', async () => {
+        const f = make();
+        await assert.rejects(f.guard.absent({ repository: REPO, tag: TAG }),
+            /Release already exists \(draft or published\)/);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('existing PUBLISHED release blocks release creation', async () => {
+        const f = make();
+        f.state.release.draft = false;
+        await assert.rejects(f.guard.absent({ repository: REPO, tag: TAG }),
+            /Release already exists \(draft or published\)/);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('GraphQL null cannot be used to prepare a DRAFT', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        await assert.rejects(f.guard.prepare(f.context),
+            /No unambiguous draft Release for tag/);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('GraphQL errors inside HTTP 200 fail closed', async () => {
+        const f = make();
+        f.state.graphqlResponse = {
+            data: { repository: { release: null } },
+            errors: [{ message: 'Insufficient release read access' }]
+        };
+        await assert.rejects(f.guard.absent({ repository: REPO, tag: TAG }),
+            /GraphQL release lookup incomplete or failed/);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('GraphQL inaccessible repository is not absence', async () => {
+        const f = make();
+        f.state.graphqlResponse = { data: { repository: null } };
+        await assert.rejects(f.guard.absent({ repository: REPO, tag: TAG }),
+            /GraphQL release lookup incomplete or failed/);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('GraphQL invalid databaseId type fails closed', async () => {
+        const f = make();
+        f.state.graphqlResponse = { data: { repository: { release: {
+            databaseId: '12345', isDraft: true, tagName: TAG
+        } } } };
+        await assert.rejects(f.guard.prepare(f.context),
+            /GraphQL release identity malformed or ambiguous/);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('GraphQL wrong databaseId fails before publication', async () => {
+        const f = make();
+        f.state.graphqlResponse = { data: { repository: { release: {
+            databaseId: 99999, isDraft: true, tagName: TAG
+        } } } };
+        await assert.rejects(f.guard.prepare(f.context), /HTTP 404/);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('GraphQL wrong tag rejected', async () => {
+        const f = make();
+        f.state.graphqlResponse = { data: { repository: { release: {
+            databaseId: 12345, isDraft: true, tagName: 'v2.0.0'
+        } } } };
+        await assert.rejects(f.guard.prepare(f.context),
+            /GraphQL release identity malformed or ambiguous/);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('GraphQL 403/429/500 failures all abort preflight', async () => {
+        for (const status of [403, 429, 500]) {
+            const f = make();
+            f.state.graphqlFailure = 'HTTP ' + status;
+            await assert.rejects(f.guard.absent({ repository: REPO, tag: TAG }),
+                new RegExp('HTTP ' + status));
+            assert.equal(f.state.patchCalls, 0);
+        }
+    });
+    await test('GraphQL draft disappearance before PATCH => zero PATCH', async () => {
+        const f = make();
+        const snapshot = await f.guard.prepare(f.context);
+        f.state.graphqlNull = true;
+        await assert.rejects(f.guard.publish(f.context, snapshot),
+            /No unambiguous draft Release for tag/);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('GraphQL published tag change after PATCH => UNKNOWN', async () => {
+        const f = make();
+        const snapshot = await f.guard.prepare(f.context);
+        f.state.afterPatchMutate = release => { release.tag_name = 'v2.0.0'; };
+        await assert.rejects(f.guard.publish(f.context, snapshot),
+            /PUBLICATION_OUTCOME_UNKNOWN/);
+        assert.equal(f.state.patchCalls, 1);
+        assert.equal(f.state.release.draft, false);
+    });
     await test('lightweight tag and exact-ID publication PASS', async () => {
         const f = make();
         const snapshot = await f.guard.prepare(f.context);
@@ -159,10 +270,10 @@ async function main() {
         /Draft Release or asset identity changed since prepared snapshot/);
     await expectNoPatch('changed remote SHA-256 rejected', f =>
         { f.state.release.assets[0].digest = 'sha256:' + 'f'.repeat(64); },
-        /Expected values to be strictly equal|Draft asset identity\/size\/digest mismatch/);
+        /Draft asset identity\/size\/digest mismatch/);
     await expectNoPatch('changed remote size rejected', f =>
         { f.state.release.assets[0].size++; },
-        /Expected values to be strictly equal|Draft asset identity\/size\/digest mismatch/);
+        /Draft asset identity\/size\/digest mismatch/);
     await expectNoPatch('missing asset ID rejected before publication', f =>
         { delete f.state.release.assets[0].id; },
         /Missing remote asset ID/, true);
@@ -174,9 +285,9 @@ async function main() {
         /No unambiguous draft Release for tag/);
     await expectNoPatch('release tag changed rejected', f =>
         { f.state.release.tag_name = 'v2.0.0'; },
-        /Draft Release ID\/tag\/state mismatch/);
+        /No unambiguous draft Release for tag/);
     await expectNoPatch('GET 404 aborts before publication', f => {
-        f.state.getFailure = { route: '/releases/tags/', message: 'HTTP 404' };
+        f.state.getFailure = { route: '/releases/12345', message: 'HTTP 404' };
     }, /HTTP 404/);
     await expectNoPatch('GET 429 aborts before publication', f => {
         f.state.getFailure = { route: '/releases/12345', message: 'HTTP 429' };
@@ -193,7 +304,7 @@ async function main() {
         const f = make();
         delete f.state.release.id;
         await assert.rejects(f.guard.prepare(f.context),
-            /No unambiguous draft Release for tag/);
+            /Draft Release ID lookup inconsistent/);
         assert.equal(f.state.patchCalls, 0);
     });
     await test('PATCH error before publication reports UNKNOWN and does not retry', async () => {
@@ -244,7 +355,16 @@ async function main() {
     });
     await test('patched github CLI 2.102.0 and 2.103.3 accepted', () => {
         requirePatchedGh('gh version 2.102.0 (2026-09-30)');
+        requirePatchedGh('gh version 2.102.1 (2026-10-02)');
         requirePatchedGh('gh version 2.103.3 (2026-11-01)');
+    });
+    await test('GH CLI pre-release and suffixed versions cannot claim stable patch', () => {
+        assert.throws(() => requirePatchedGh('gh version 2.102.0-rc.1 (2026-09-28)'),
+            /Cannot determine stable GitHub CLI/);
+        assert.throws(() => requirePatchedGh('gh version 2.103.0-dev'),
+            /Cannot determine stable GitHub CLI/);
+        assert.throws(() => requirePatchedGh('gh version 2.101.99 (2026-11-01)'),
+            /GitHub CLI 2.102.0\+ required/);
     });
     await test('exact-source signer identity args on four files', () => {
         const args = attestationArgs('dist/release', REPO, REF, COMMIT, 'release_ota.yml');
