@@ -11,11 +11,14 @@
  *
  * Usage:
  * node tools/release_publication_guard.js absent <owner/repo> <tag>
+ * node tools/release_publication_guard.js stage <dir> <owner/repo> <tag> <40hex-commit> <snapshot-json>
  * node tools/release_publication_guard.js prepare <dir> <owner/repo> <tag> <40hex-commit> <snapshot-json>
  * node tools/release_publication_guard.js publish <dir> <owner/repo> <tag> <40hex-commit> <snapshot-json>
  */
 const fs = require('node:fs');
 const cp = require('node:child_process');
+const path = require('node:path');
+const crypto = require('node:crypto');
 const { verifyReleaseAssets, NAMES } = require('./verify_release_assets.js');
 
 function requireValid(ok, message) {
@@ -135,9 +138,35 @@ async function readDraft(api, ctx) {
     return { graph, byId };
 }
 
-function createGuard(api, verifyAssets = verifyReleaseAssets) {
+/* IDs and asset paths are derived from trusted, validated create responses.
+ * Never take a user-controlled or API-controlled upload URL as an arbitrary
+ * network destination; GitHub.com uploads use this exact numeric-ID route. */
+function uploadEndpoint(ctx, releaseId, name) {
+    requireValid(positiveId(releaseId) && NAMES.includes(name), 'Invalid new release asset target');
+    return 'https://uploads.github.com/' + pathFor(ctx,
+        'releases/' + releaseId + '/assets') + '?name=' + encodeURIComponent(name);
+}
+function assertCreatedDraft(release, ctx, releaseId, expectedAssets) {
+    requireValid(release && release.id === releaseId && release.draft === true &&
+        release.tag_name === ctx.tag && Array.isArray(release.assets) &&
+        release.assets.length === expectedAssets.length, 'Created draft ID/tag/state/assets changed');
+    const canonical = release.assets.map(asset => ({
+        id: asset && asset.id, name: asset && asset.name,
+        size: asset && asset.size, digest: asset && asset.digest,
+        state: asset && asset.state
+    })).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    requireValid(canonical.every(a => positiveId(a.id) && a.state === 'uploaded') &&
+        new Set(canonical.map(a => a.id)).size === canonical.length &&
+        same(canonical, expectedAssets.map(a => ({ ...a, state: 'uploaded' }))
+            .sort((a, b) => a.name.localeCompare(b.name))),
+    'Created draft asset identity changed or unexpected asset present');
+}
+
+function createGuard(api, verifyAssets = verifyReleaseAssets,
+    readAsset = filename => fs.readFileSync(filename)) {
     requireValid(api && typeof api.get === 'function' &&
-        typeof api.graphql === 'function' && typeof api.patch === 'function',
+        typeof api.graphql === 'function' && typeof api.patch === 'function' &&
+        typeof api.create === 'function' && typeof api.upload === 'function',
         'Missing GitHub API adapter');
     return {
         async absent(ctx) {
@@ -146,6 +175,92 @@ function createGuard(api, verifyAssets = verifyReleaseAssets) {
             requireValid(found === null,
                 'Release already exists (draft or published); refusing overwrite');
             return true;
+        },
+        /* Create-only: one REST POST. NEVER use the upsert/overwrite semantics
+         * of a GitHub Release Action. The response ID owns every subsequent
+         * asset upload. Any uncertain POST/upload response stops without retry,
+         * cleanup or mutation of any pre-existing Release. */
+        async stage(ctx) {
+            validateContext(ctx);
+            const verified = verifyAssets(ctx.directory, ctx.repository, ctx.tag);
+            requireValid(Array.isArray(verified) && verified.length === NAMES.length &&
+                NAMES.every(n => verified.some(f => f.name === n)),
+            'Exactly four verified local assets required before create');
+            await assertLiveTag(api, ctx);
+            const preflight = await lookupReleaseByGraphql(api, ctx);
+            requireValid(preflight === null,
+                'Release already exists (draft or published); refusing create-only POST');
+            await assertLiveTag(api, ctx);
+            const payload = {
+                tag_name: ctx.tag,
+                target_commitish: ctx.commit,
+                name: 'Release ' + ctx.tag + ' — Native Zigbee OTA Upgrade',
+                draft: true,
+                prerelease: false,
+                generate_release_notes: true
+            };
+            let created;
+            try {
+                created = await api.create(pathFor(ctx, 'releases'), payload);
+            } catch (err) {
+                throw new Error('CREATE_OUTCOME_UNKNOWN: REST create-only POST may have ' +
+                    'succeeded; do not retry or delete; inspect GitHub manually: ' + err.message);
+            }
+            const id = created && created.id;
+            requireValid(positiveId(id) && created.draft === true &&
+                created.tag_name === ctx.tag && Array.isArray(created.assets) &&
+                created.assets.length === 0,
+            'CREATE_OUTCOME_UNKNOWN: Unexpected create response; no upload/retry');
+            const expected = [];
+            const url = pathFor(ctx, 'releases/' + id);
+            /* Do not upload to any Release other than the exact ID returned
+             * from this successful create-only POST. */
+            const check = async () => {
+                await assertLiveTag(api, ctx);
+                const graph = await lookupReleaseByGraphql(api, ctx);
+                requireValid(graph && graph.id === id && graph.draft === true,
+                    'Created draft GraphQL ID/state mismatch');
+                const live = await api.get(url);
+                assertCreatedDraft(live, ctx, id, expected);
+                return live;
+            };
+            await check();
+            for (const file of verified) {
+                requireValid(NAMES.includes(file.name) && typeof file.sha256 === 'string' &&
+                    /^[0-9a-f]{64}$/.test(file.sha256) && file.size > 0,
+                'Malformed local asset evidence');
+                await check(); // explicit numerical-ID + zero-unexpected-assets guard
+                const localPath = path.join(ctx.directory, file.name);
+                const data = readAsset(localPath);
+                requireValid(data.length === file.size &&
+                    crypto.createHash('sha256').update(data).digest('hex') === file.sha256,
+                'Local release asset changed since verification');
+                let uploaded;
+                try {
+                    uploaded = await api.upload(uploadEndpoint(ctx, id, file.name), localPath);
+                } catch (err) {
+                    throw new Error('ASSET_UPLOAD_OUTCOME_UNKNOWN: asset may already be ' +
+                        'uploaded; do not retry/delete/overwrite: ' + err.message);
+                }
+                requireValid(uploaded && positiveId(uploaded.id) &&
+                    uploaded.name === file.name && uploaded.size === file.size &&
+                    uploaded.digest === 'sha256:' + file.sha256 &&
+                    uploaded.state === 'uploaded' &&
+                    expected.every(asset => asset.id !== uploaded.id),
+                'ASSET_UPLOAD_OUTCOME_UNKNOWN: Unexpected upload response; no retry/delete');
+                expected.push({
+                    id: uploaded.id, name: uploaded.name,
+                    size: uploaded.size, digest: uploaded.digest
+                });
+                await check();
+            }
+            const final = await check();
+            const snapshot = captureDraft(final, ctx, verifyAssets);
+            requireValid(snapshot.releaseId === id &&
+                same(snapshot.assets, [...expected].sort((a, b) => a.name.localeCompare(b.name))),
+            'Created draft snapshot differs from verified uploaded asset identities');
+            await assertLiveTag(api, ctx);
+            return snapshot;
         },
         async prepare(ctx) {
             validateContext(ctx);
@@ -258,8 +373,8 @@ function ghText(args) {
     return result.stdout;
 }
 
-function ghJson(args) {
-    const result = cp.spawnSync('gh', args, { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+function ghJson(args, input) {
+    const result = cp.spawnSync('gh', args, { input, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
     if (result.error) throw result.error;
     requireValid(result.status === 0,
         'GitHub API failed (' + result.status + '): ' + (result.stderr || '').slice(0, 500));
@@ -270,6 +385,19 @@ const RELEASE_QUERY = 'query($owner: String!, $name: String!, $tagName: String!)
     '{ release(tagName: $tagName) { databaseId isDraft tagName } } }';
 const ghApi = {
     get: endpoint => Promise.resolve(ghJson(['api', endpoint])),
+    create: (endpoint, payload) => Promise.resolve(ghJson([
+        'api', '-X', 'POST', endpoint, '-H', 'Content-Type: application/json',
+        '--input', '-'
+    ], JSON.stringify(payload))),
+    upload: (endpoint, filename) => {
+        requireValid(/^https:\/\/uploads\.github\.com\/repos\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/releases\/[1-9][0-9]*\/assets\?name=/.test(endpoint),
+            'Refuse noncanonical upload endpoint');
+        return Promise.resolve(ghJson([
+            'api', '-X', 'POST', endpoint,
+            '-H', 'Content-Type: application/octet-stream',
+            '--input', filename
+        ]));
+    },
     graphql: (repository, tag) => {
         const [owner, name] = repository.split('/');
         return Promise.resolve(ghJson(['api', 'graphql',
@@ -297,14 +425,16 @@ async function main() {
         console.log('[PASS] ' + verified + ' source-commit/ref/signer pinned attestations');
         return;
     }
-    requireValid((mode === 'prepare' || mode === 'publish') && snapshotFile,
-        'Usage: release_publication_guard.js prepare|publish <dir> <repo> <tag> <commit> <snapshot>');
+    requireValid((mode === 'stage' || mode === 'prepare' || mode === 'publish') && snapshotFile,
+        'Usage: release_publication_guard.js stage|prepare|publish <dir> <repo> <tag> <commit> <snapshot>');
     const ctx = { directory, repository, tag, commit };
     const guard = createGuard(ghApi);
-    if (mode === 'prepare') {
-        const snapshot = await guard.prepare(ctx);
+    if (mode === 'prepare' || mode === 'stage') {
+        /* Refuse an existing snapshot BEFORE any create-only POST. */
+        requireValid(!fs.existsSync(snapshotFile), 'Snapshot already exists; no create/retry');
+        const snapshot = mode === 'stage' ? await guard.stage(ctx) : await guard.prepare(ctx);
         fs.writeFileSync(snapshotFile, JSON.stringify(snapshot, null, 2) + '\n', { flag: 'wx' });
-        console.log('[PASS] Draft Release ID and 4 exact asset identities captured; no publication');
+        console.log('[PASS] Newly staged DRAFT Release ID and 4 exact asset identities; not public');
     } else {
         const snapshot = JSON.parse(fs.readFileSync(snapshotFile, 'utf8'));
         const published = await guard.publish(ctx, snapshot);
@@ -319,5 +449,5 @@ if (require.main === module) {
     });
 }
 module.exports = { createGuard, validateContext, captureDraft, compareReleaseToSnapshot,
-    assertLiveTag, lookupReleaseByGraphql, requirePatchedGh, attestationArgs,
-    verifyAttestations };
+    assertLiveTag, lookupReleaseByGraphql, uploadEndpoint, assertCreatedDraft,
+    requirePatchedGh, attestationArgs, verifyAttestations };

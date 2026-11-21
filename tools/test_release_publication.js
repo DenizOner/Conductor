@@ -6,8 +6,11 @@
  * NO network, credentials, GitHub Release, tag, or real file mutation occurs.
  */
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
+const path = require('node:path');
 const {
-    createGuard, requirePatchedGh, attestationArgs, verifyAttestations
+    createGuard, requirePatchedGh, attestationArgs, verifyAttestations,
+    uploadEndpoint
 } = require('./release_publication_guard.js');
 
 const REPO = 'DenizOner/Conductor';
@@ -17,8 +20,10 @@ const OTHER = 'b'.repeat(40);
 const REF = 'refs/tags/' + TAG;
 const NAMES = ['firmware.bin', '1000-0906-010400aa-LogitechZ906.ota',
     'index.json', 'conductor_converter.mjs'];
+const FIXTURES = NAMES.map((name, index) => Buffer.alloc(100 + index, index + 1));
 const VERIFIED = NAMES.map((name, index) => ({
-    name, size: 100 + index, sha256: String(index + 1).repeat(64)
+    name, size: FIXTURES[index].length,
+    sha256: crypto.createHash('sha256').update(FIXTURES[index]).digest('hex')
 }));
 let passed = 0;
 
@@ -32,7 +37,10 @@ function make() {
         releaseId: 12345, patchCalls: 0, patchPath: null, patchPayload: null,
         getFailure: null, patchFailure: null, afterPublishReadFailure: null,
         afterPatchMutate: null, graphqlFailure: null, graphqlNull: false,
-        graphqlResponse: null, graphqlCalls: 0, restTagCalls: 0
+        graphqlResponse: null, graphqlCalls: 0, restTagCalls: 0,
+        createCalls: 0, uploadCalls: 0, createFailure: null,
+        uploadFailure: null, afterCreateMutation: null, afterUploadMutation: null,
+        createResponseOverride: null, uploadResponseOverride: null
     };
     state.release = {
         id: 12345, tag_name: TAG, draft: true,
@@ -86,6 +94,46 @@ function make() {
                 };
             return { data: { repository: { release } } };
         },
+        async create(route, body) {
+            state.createCalls++;
+            assert.equal(route, 'repos/' + REPO + '/releases');
+            assert.equal(body.tag_name, TAG);
+            assert.equal(body.target_commitish, COMMIT);
+            assert.equal(body.draft, true);
+            assert.equal(body.prerelease, false);
+            if (state.createFailure === 'collision-draft' ||
+                state.createFailure === 'collision-public') {
+                state.graphqlNull = false;
+                state.release.draft = state.createFailure === 'collision-draft';
+                throw new Error('HTTP 422: Release already exists');
+            }
+            if (state.createFailure === 'before') throw new Error('HTTP 429');
+            state.graphqlNull = false;
+            state.release = { id: state.releaseId, tag_name: TAG, draft: true, assets: [] };
+            const createdResponse = clone(state.release);
+            if (state.afterCreateMutation) state.afterCreateMutation(state);
+            if (state.createFailure === 'after') throw new Error('Remote connection lost');
+            return state.createResponseOverride || createdResponse;
+        },
+        async upload(endpoint, filename) {
+            state.uploadCalls++;
+            assert.ok(endpoint.startsWith('https://uploads.github.com/repos/' + REPO +
+                '/releases/' + state.releaseId + '/assets?name='));
+            const name = decodeURIComponent(endpoint.split('?name=')[1]);
+            assert.equal(path.basename(filename), name);
+            if (state.uploadFailure === 'before') throw new Error('HTTP 409');
+            const file = VERIFIED.find(f => f.name === name);
+            assert.ok(file, 'No unexpected asset names');
+            const asset = {
+                id: 200 + NAMES.indexOf(name), name, size: file.size,
+                digest: 'sha256:' + file.sha256, state: 'uploaded'
+            };
+            state.release.assets.push(asset);
+            const uploadResponse = clone(asset);
+            if (state.afterUploadMutation) state.afterUploadMutation(state);
+            if (state.uploadFailure === 'after') throw new Error('Upload response lost');
+            return state.uploadResponseOverride || uploadResponse;
+        },
         async patch(route, body) {
             state.patchCalls++;
             state.patchPath = route;
@@ -108,7 +156,12 @@ function make() {
      * The production publication guard must detect remote digest/size errors
      * itself. A mock AssertionError must never masquerade as a security PASS. */
     const verifyAssets = () => clone(VERIFIED);
-    return { context, state, api, guard: createGuard(api, verifyAssets) };
+    const readAsset = filename => {
+        const index = NAMES.indexOf(path.basename(filename));
+        assert.notEqual(index, -1, 'Unexpected synthetic fixture');
+        return FIXTURES[index];
+    };
+    return { context, state, api, guard: createGuard(api, verifyAssets, readAsset) };
 }
 async function test(name, run) {
     await run();
@@ -133,6 +186,162 @@ async function expectNoPatch(name, mutate, pattern, beforePrepare = false) {
 }
 
 async function main() {
+    await test('P20-S2b: create-only stage uploads exactly four files to NEW numeric ID', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        const snapshot = await f.guard.stage(f.context);
+        assert.equal(snapshot.releaseId, 12345);
+        assert.equal(snapshot.assets.length, 4);
+        assert.equal(f.state.createCalls, 1);
+        assert.equal(f.state.uploadCalls, 4);
+        assert.equal(f.state.patchCalls, 0);
+        assert.equal(f.state.restTagCalls, 0);
+        assert.equal(f.state.release.draft, true);
+        assert.deepEqual(snapshot.assets.map(a => a.name).sort(), [...NAMES].sort());
+    });
+    await test('P20-S2b: stage snapshot supports guarded numeric-ID publication', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        const snapshot = await f.guard.stage(f.context);
+        const result = await f.guard.publish(f.context, snapshot);
+        assert.equal(result.published, true);
+        assert.equal(f.state.createCalls, 1);
+        assert.equal(f.state.uploadCalls, 4);
+        assert.equal(f.state.patchCalls, 1);
+        assert.equal(f.state.patchPath, 'repos/' + REPO + '/releases/12345');
+    });
+    await test('P20-S2b: uploadEndpoint requires canonical name and numeric ID', async () => {
+        assert.equal(uploadEndpoint({ repository: REPO }, 12345, NAMES[0]),
+            'https://uploads.github.com/repos/' + REPO +
+            '/releases/12345/assets?name=firmware.bin');
+        assert.throws(() => uploadEndpoint({ repository: REPO }, -2, NAMES[0]),
+            /Invalid new release asset target/);
+        assert.throws(() => uploadEndpoint({ repository: REPO }, 12345, 'evil.bin'),
+            /Invalid new release asset target/);
+    });
+    await test('P20-S2b: existing DRAFT => zero create/upload/PATCH', async () => {
+        const f = make();
+        await assert.rejects(f.guard.stage(f.context),
+            /Release already exists \(draft or published\); refusing create-only POST/);
+        assert.equal(f.state.createCalls, 0);
+        assert.equal(f.state.uploadCalls, 0);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('P20-S2b: existing published Release => zero create/upload/PATCH', async () => {
+        const f = make();
+        f.state.release.draft = false;
+        await assert.rejects(f.guard.stage(f.context),
+            /Release already exists \(draft or published\); refusing create-only POST/);
+        assert.equal(f.state.createCalls, 0);
+        assert.equal(f.state.uploadCalls, 0);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('P20-S2b: race to create other DRAFT => POST 422; zero upload', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        f.state.createFailure = 'collision-draft';
+        await assert.rejects(f.guard.stage(f.context), /CREATE_OUTCOME_UNKNOWN:.*HTTP 422/);
+        assert.equal(f.state.createCalls, 1);
+        assert.equal(f.state.uploadCalls, 0);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('P20-S2b: race to create other PUBLIC Release => POST 422; zero upload', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        f.state.createFailure = 'collision-public';
+        await assert.rejects(f.guard.stage(f.context), /CREATE_OUTCOME_UNKNOWN:.*HTTP 422/);
+        assert.equal(f.state.createCalls, 1);
+        assert.equal(f.state.uploadCalls, 0);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('P20-S2b: POST HTTP429 before create never retried', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        f.state.createFailure = 'before';
+        await assert.rejects(f.guard.stage(f.context), /CREATE_OUTCOME_UNKNOWN:.*HTTP 429/);
+        assert.equal(f.state.createCalls, 1);
+        assert.equal(f.state.uploadCalls, 0);
+    });
+    await test('P20-S2b: lost POST response after new draft leaves it untouched', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        f.state.createFailure = 'after';
+        await assert.rejects(f.guard.stage(f.context),
+            /CREATE_OUTCOME_UNKNOWN:.*Remote connection lost/);
+        assert.equal(f.state.createCalls, 1);
+        assert.equal(f.state.uploadCalls, 0);
+        assert.equal(f.state.release.draft, true);
+        assert.deepEqual(f.state.release.assets, []);
+    });
+    await test('P20-S2b: malformed create response forbids asset upload', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        f.state.createResponseOverride = { id: '12345', tag_name: TAG, draft: true, assets: [] };
+        await assert.rejects(f.guard.stage(f.context),
+            /CREATE_OUTCOME_UNKNOWN: Unexpected create response/);
+        assert.equal(f.state.createCalls, 1);
+        assert.equal(f.state.uploadCalls, 0);
+    });
+    await test('P20-S2b: externally published draft before upload => zero upload', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        f.state.afterCreateMutation = state => { state.release.draft = false; };
+        await assert.rejects(f.guard.stage(f.context),
+            /Created draft GraphQL ID\/state mismatch/);
+        assert.equal(f.state.createCalls, 1);
+        assert.equal(f.state.uploadCalls, 0);
+    });
+    await test('P20-S2b: foreign pre-existing asset after create => no upload', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        f.state.afterCreateMutation = state => {
+            state.release.assets.push({
+                id: 987, name: 'foreign-file', size: 10,
+                state: 'uploaded', digest: 'sha256:' + 'a'.repeat(64)
+            });
+        };
+        await assert.rejects(f.guard.stage(f.context),
+            /Created draft ID\/tag\/state\/assets changed/);
+        assert.equal(f.state.uploadCalls, 0);
+    });
+    await test('P20-S2b: HTTP 409 on asset upload => no retry/delete', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        f.state.uploadFailure = 'before';
+        await assert.rejects(f.guard.stage(f.context),
+            /ASSET_UPLOAD_OUTCOME_UNKNOWN:.*HTTP 409/);
+        assert.equal(f.state.createCalls, 1);
+        assert.equal(f.state.uploadCalls, 1);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('P20-S2b: lost upload response => asset may exist, never auto retry', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        f.state.uploadFailure = 'after';
+        await assert.rejects(f.guard.stage(f.context),
+            /ASSET_UPLOAD_OUTCOME_UNKNOWN:.*Upload response lost/);
+        assert.equal(f.state.uploadCalls, 1);
+        assert.equal(f.state.release.assets.length, 1);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('P20-S2b: post-upload external asset mutation fails, never public', async () => {
+        const f = make();
+        f.state.graphqlNull = true;
+        f.state.afterUploadMutation = state => {
+            state.release.assets[0].digest = 'sha256:' + '0'.repeat(64);
+        };
+        await assert.rejects(f.guard.stage(f.context),
+            /Created draft asset identity changed or unexpected asset present/);
+        assert.equal(f.state.uploadCalls, 1);
+        assert.equal(f.state.patchCalls, 0);
+    });
+    await test('P20-S2a-002: GraphQL ID 99999 REST 200 JSON ID 12345 is rejected', async () => {
+        const f = make();
+        f.state.releaseId = 99999; // GraphQL resolves 99999, mocked REST route 200 returns id=12345.
+        await assert.rejects(f.guard.prepare(f.context),
+            /Draft Release ID lookup inconsistent/);
+        assert.equal(f.state.patchCalls, 0);
+    });
     await test('draft REST-by-tag 404; GraphQL plus numeric ID prepare succeeds', async () => {
         const f = make();
         await assert.rejects(f.api.get('repos/' + REPO + '/releases/tags/' + TAG), /HTTP 404/);

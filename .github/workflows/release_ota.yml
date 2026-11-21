@@ -159,27 +159,13 @@ jobs:
           set -euo pipefail
           node tools/release_publication_guard.js absent "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
 
-      - name: Create DRAFT GitHub Release and Upload Verified Artifacts
-        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
-        with:
-          name: "Release ${{ github.ref_name }} — Native Zigbee OTA Upgrade"
-          draft: true
-          prerelease: false
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: |
-            dist/release/firmware.bin
-            dist/release/1000-0906-010400aa-LogitechZ906.ota
-            dist/release/index.json
-            dist/release/conductor_converter.mjs
-
-      - name: Pin DRAFT Release ID, Tag Commit and Four Asset IDs/Digests
+      - name: Create Only a NEW DRAFT and Upload Four Assets by Its Exact ID
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          node tools/release_publication_guard.js prepare dist/release "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA" "$RUNNER_TEMP/conductor-release-snapshot.json"
+          node tools/release_publication_guard.js stage dist/release "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA" "$RUNNER_TEMP/conductor-release-snapshot.json"
 
       - name: Recheck Pinned DRAFT and Publish Only by Exact Release ID
         env:
