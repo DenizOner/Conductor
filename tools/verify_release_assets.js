@@ -17,6 +17,9 @@ const MAX_OTA_SLOT_BYTES = 0x1C0000;
 const FILE_VERSION = 0x010400AA;
 const MANUFACTURER = 0x131B;
 const IMAGE_TYPE = 0x0906;
+const STACK_VERSION = 0x0002;
+const HEADER_STRING = Buffer.from('Conductor - Smart Zigbee Console for Logitech z906', 'ascii')
+    .subarray(0, 32);
 
 function insist(condition, message) {
     if (!condition) throw new Error(message);
@@ -26,9 +29,31 @@ function sha(buffer, algorithm) {
     return crypto.createHash(algorithm).update(buffer).digest('hex');
 }
 
+/* Bind the tag to the actual firmware definitions. The stable OTA encoding
+ * must match the C firmware macros as well as the canonical package version. */
+function expectedReleaseTag() {
+    const config = fs.readFileSync(path.join(__dirname, '..', 'include', 'config.h'), 'utf8');
+    const major = config.match(/^\s*#define\s+Z906_FW_VERSION_MAJOR\s+([0-9]+)\s*$/m);
+    const minor = config.match(/^\s*#define\s+Z906_FW_VERSION_MINOR\s+([0-9]+)\s*$/m);
+    const patch = config.match(/^\s*#define\s+Z906_FW_VERSION_PATCH\s+([0-9]+)\s*$/m);
+    const versionString = config.match(/^\s*#define\s+Z906_FW_VERSION_STR\s+"([0-9]+\.[0-9]+\.[0-9]+)"\s*$/m);
+    const encodedString = config.match(/^\s*#define\s+Z906_OTA_FILE_VERSION\s+(0x[0-9a-fA-F]+)\s*$/m);
+    insist(major && minor && patch && versionString && encodedString,
+        'Missing canonical firmware version definitions');
+    const parts = [Number(major[1]), Number(minor[1]), Number(patch[1])];
+    insist(parts.every(n => Number.isSafeInteger(n) && n >= 0 && n <= 255),
+        'Invalid firmware version components');
+    insist(versionString[1] === parts.join('.'), 'Firmware version string/macro mismatch');
+    const encoded = (parts[0] * 0x1000000 + parts[1] * 0x10000 + parts[2] * 0x100 + 0xAA) >>> 0;
+    insist(Number.parseInt(encodedString[1], 16) === encoded && FILE_VERSION === encoded,
+        'Firmware OTA version/packager mismatch');
+    return 'v' + parts.join('.');
+}
+
 function verifyReleaseAssets(directory, repository, tag, release) {
     insist(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository), 'Invalid repository identifier');
-    insist(/^v[0-9][A-Za-z0-9._-]*$/.test(tag), 'Invalid version tag');
+    insist(/^v[0-9]+\.[0-9]+\.[0-9]+$/.test(tag), 'Invalid version tag');
+    insist(tag === expectedReleaseTag(), 'Release tag does not match firmware version');
 
     const actualNames = fs.readdirSync(directory).sort();
     insist(actualNames.length === NAMES.length &&
@@ -51,6 +76,9 @@ function verifyReleaseAssets(directory, repository, tag, release) {
     insist(ota.readUInt32LE(0) === 0x0BEEF11E, 'OTA magic mismatch');
     insist(ota.readUInt16LE(4) === 0x0100 && ota.readUInt16LE(6) === 56,
         'OTA header version or length mismatch');
+    insist(ota.readUInt16LE(8) === 0x0000, 'OTA header field control mismatch');
+    insist(ota.readUInt16LE(18) === STACK_VERSION, 'OTA Zigbee stack version mismatch');
+    insist(ota.subarray(20, 52).equals(HEADER_STRING), 'OTA header string mismatch');
     insist(ota.readUInt16LE(10) === MANUFACTURER && ota.readUInt16LE(12) === IMAGE_TYPE,
         'OTA device identity mismatch');
     insist(ota.readUInt32LE(14) === FILE_VERSION, 'OTA firmware version mismatch');
