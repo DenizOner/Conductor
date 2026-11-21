@@ -88,8 +88,19 @@ jobs:
           cp dist/index.json dist/release/
           cp tools/conductor_converter.mjs dist/release/
 
+      - name: Validate Four Local Release Assets Before Attestation
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            RELEASE_TAG="$GITHUB_REF_NAME"
+          else
+            RELEASE_TAG="v1.4.0" # Branch-only workflow_dispatch never publishes.
+          fi
+          node tools/verify_release_assets.js dist/release "$GITHUB_REPOSITORY" "$RELEASE_TAG"
+
       - name: Attest Build Provenance for Release Assets
-        uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/release/firmware.bin
@@ -98,10 +109,11 @@ jobs:
             dist/release/conductor_converter.mjs
 
       - name: Upload Release Artifacts
-        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-assets
           path: dist/release/
+          if-no-files-found: error
           retention-days: 7
 
   publish-release:
@@ -112,23 +124,53 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      attestations: read
 
     steps:
+      - name: Check out verification scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Node.js for read-only verification
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4.2.0
+        with:
+          node-version: '22'
+
       - name: Download Release Artifacts
-        uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4.1.9
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-assets
           path: dist/release/
+          digest-mismatch: error
 
-      - name: Create GitHub Release and Upload Verified Artifacts
-        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
-        with:
-          name: "Release ${{ github.ref_name }} — Native Zigbee OTA Upgrade"
-          draft: false
-          prerelease: false
-          generate_release_notes: true
-          files: |
-            dist/release/firmware.bin
-            dist/release/1000-0906-010400aa-LogitechZ906.ota
-            dist/release/index.json
-            dist/release/conductor_converter.mjs
+      - name: Verify Downloaded Assets and Build Attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tools/verify_release_assets.js dist/release "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
+          node tools/release_publication_guard.js attest dist/release "$GITHUB_REPOSITORY" "$GITHUB_REF" "$GITHUB_SHA" release_ota.yml
+
+      - name: Refuse Existing DRAFT or Published Release (GraphQL)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tools/release_publication_guard.js absent "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
+
+      - name: Create Only a NEW DRAFT and Upload Four Assets by Its Exact ID
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tools/release_publication_guard.js stage dist/release "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA" "$RUNNER_TEMP/conductor-release-snapshot.json"
+
+      - name: Recheck Pinned DRAFT and Publish Only by Exact Release ID
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tools/release_publication_guard.js publish dist/release "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA" "$RUNNER_TEMP/conductor-release-snapshot.json"
