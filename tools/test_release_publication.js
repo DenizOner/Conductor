@@ -351,7 +351,7 @@ async function main() {
         assert.throws(() => requirePatchedGh('gh version 2.101.0 (2026-09-01)'),
             /GitHub CLI 2.102.0\+ required/);
         assert.throws(() => requirePatchedGh('unrecognizable'),
-            /Cannot determine GitHub CLI/);
+            /Cannot determine stable GitHub CLI security patch version/);
     });
     await test('patched github CLI 2.102.0 and 2.103.3 accepted', () => {
         requirePatchedGh('gh version 2.102.0 (2026-09-30)');
