@@ -140,7 +140,7 @@ function runTests() {
             const needs = fixture();
             needs['dependency-review'].result = result;
             expectCase(eventName + ' non-PR Dependency Review ' + result,
-                eventName, needs, false, 'dependency-review');
+                eventName, needs, false, 'Dependency Review');
         }
     }
 
