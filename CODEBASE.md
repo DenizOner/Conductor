@@ -575,12 +575,14 @@ Final acceptance is deliberately a **separate read-only check after the
 entire run is completed**. `tools/validate_ci_acceptance_gate.js --verify-run`
 takes complete GitHub REST JSON for that workflow run and for its
 matching attempt-specific jobs. The caller must supply exact PR HEAD,
-PR base, run ID and attempt. The verifier requires:
+PR base, PR number, run ID and attempt. The verifier requires:
 
 - `run.status == completed` and `run.conclusion == success`;
 - exact `CI` workflow and `pull_request`/allowed non-PR event;
-- matching run ID, attempt, full head SHA and PR head/base association;
-- all four uniquely named jobs with matching IDs, attempts, SHA,
+- matching run ID, attempt, full head SHA and **PR number, head and base**
+  within the same PR association record (non-PR: PR number N/A);
+- all four uniquely named jobs with **unique positive integer job IDs**,
+  matching run IDs, attempts, SHA,
   `completed` status and `success` conclusion (except explicit
   non-PR Dependency Review N/A);
 - full job page without missing/extra jobs or pagination ambiguity.
@@ -591,10 +593,13 @@ Read-only verification procedure after CI is finished:
 2. Read `GET /repos/DenizOner/Conductor/actions/runs/<id>/attempts/<attempt>/jobs?per_page=100`.
 3. Supply the JSON responses as `CI_GATE_RUN_JSON` and
    `CI_GATE_JOBS_JSON`. Supply `CI_GATE_EXPECTED_HEAD_SHA`,
-   `CI_GATE_EXPECTED_BASE_SHA`, `CI_GATE_EXPECTED_RUN_ID` and
-   `CI_GATE_EXPECTED_RUN_ATTEMPT` from the PR's independently
+   `CI_GATE_EXPECTED_BASE_SHA`, `CI_GATE_EXPECTED_PR_NUMBER`,
+   `CI_GATE_EXPECTED_RUN_ID` and `CI_GATE_EXPECTED_RUN_ATTEMPT` from
+   the PR's independently
    verified exact identity, then execute
    `node tools/validate_ci_acceptance_gate.js --verify-run`.
+   For non-PR events leave `CI_GATE_EXPECTED_PR_NUMBER` unset; the
+   Dependency Review job must be `skipped` and is reported N/A.
 4. Separately verify the PR test-merge source tree and applicable
    CodeQL/smoke results. Preserve the exact-HEAD CI evidence.
 

@@ -12,6 +12,7 @@
  *   CI_GATE_RUN_JSON='...' CI_GATE_JOBS_JSON='...' \
  *   CI_GATE_EXPECTED_HEAD_SHA='<40-hex>' \
  *   CI_GATE_EXPECTED_BASE_SHA='<40-hex-for-PR>' \
+ *   CI_GATE_EXPECTED_PR_NUMBER='<PR-number-for-PR>' \
  *   CI_GATE_EXPECTED_RUN_ID='<run-id>' CI_GATE_EXPECTED_RUN_ATTEMPT='1' \
  *     node tools/validate_ci_acceptance_gate.js --verify-run
  *   --verify-run is ONLY valid after the whole GitHub run completes.
@@ -135,11 +136,17 @@ function verifyCompletedRun(run, page, expected) {
     }
     if (run.event === 'pull_request' &&
             (!isObject(expected) || !isSha(expected.base) ||
+            !Number.isSafeInteger(expected.prNumber) || expected.prNumber <= 0 ||
             !Array.isArray(run.pull_requests) ||
             !run.pull_requests.some((pr) => isObject(pr) &&
+                pr.number === expected.prNumber &&
                 isObject(pr.head) && isObject(pr.base) &&
                 pr.head.sha === expected.head && pr.base.sha === expected.base))) {
-        failures.push('PR head/base association missing or stale');
+        failures.push('PR number/head/base association missing or stale');
+    }
+    if (run.event !== 'pull_request' && isObject(expected) &&
+            expected.prNumber !== null) {
+        failures.push('Unexpected PR number for non-PR event');
     }
     if (!isObject(page) || !Array.isArray(page.jobs) ||
             page.total_count !== CI_JOB_NAMES.length ||
@@ -149,6 +156,7 @@ function verifyCompletedRun(run, page, expected) {
     }
 
     const seen = new Set();
+    const seenJobIds = new Set();
     for (const job of page.jobs) {
         if (!isObject(job) || !CI_JOB_NAMES.includes(job.name) ||
                 seen.has(job.name)) {
@@ -156,16 +164,24 @@ function verifyCompletedRun(run, page, expected) {
             continue;
         }
         seen.add(job.name);
+        if (!Number.isSafeInteger(job.id) || job.id <= 0 ||
+                seenJobIds.has(job.id)) {
+            failures.push('Missing, invalid or duplicated numeric job ID: ' +
+                job.name);
+        } else {
+            seenJobIds.add(job.id);
+        }
         if (!isObject(expected) || job.run_id !== expected.id ||
                 job.run_attempt !== expected.attempt ||
                 job.head_sha !== expected.head || job.workflow_name !== 'CI') {
             failures.push('Job identity mismatch: ' + job.name);
         }
-        const allowedSkip = job.name === 'Dependency Review' &&
-            run.event !== 'pull_request' && EVENTS.includes(run.event) &&
-            job.status === 'completed' && job.conclusion === 'skipped';
-        if (job.status !== 'completed' ||
-                (job.conclusion !== 'success' && !allowedSkip)) {
+        const nonPrDependency = job.name === 'Dependency Review' &&
+            run.event !== 'pull_request' && EVENTS.includes(run.event);
+        if (nonPrDependency && job.conclusion !== 'skipped') {
+            failures.push('dependency-review must be skipped (N/A) outside PR');
+        } else if (job.status !== 'completed' ||
+                (!nonPrDependency && job.conclusion !== 'success')) {
             failures.push('Job not successful: ' + job.name);
         }
     }
@@ -182,17 +198,20 @@ function runCompletedWorkflowTests() {
     const head = 'a'.repeat(40);
     const base = 'b'.repeat(40);
     function fixture(eventName = 'pull_request') {
-        const expected = { head, base, id: 123, attempt: 2 };
+        const expected = {
+            head, base, id: 123, attempt: 2,
+            prNumber: eventName === 'pull_request' ? 21 : null,
+        };
         const run = {
             id: 123, run_attempt: 2, head_sha: head,
             name: 'CI', path: '.github/workflows/ci.yml',
             status: 'completed', conclusion: 'success', event: eventName,
-            pull_requests: [{ head: { sha: head }, base: { sha: base } }],
+            pull_requests: [{ number: 21, head: { sha: head }, base: { sha: base } }],
         };
         const page = {
             total_count: 4,
-            jobs: CI_JOB_NAMES.map((name) => ({
-                name, status: 'completed',
+            jobs: CI_JOB_NAMES.map((name, index) => ({
+                id: 1001 + index, name, status: 'completed',
                 conclusion: name === 'Dependency Review' &&
                     eventName !== 'pull_request' ? 'skipped' : 'success',
                 run_id: 123, run_attempt: 2, head_sha: head,
@@ -201,8 +220,9 @@ function runCompletedWorkflowTests() {
         };
         return { run, page, expected };
     }
-    function expectCase(label, mutate, shouldPass, message = '') {
-        const data = fixture();
+    function expectCase(label, mutate, shouldPass, message = '',
+            eventName = 'pull_request') {
+        const data = fixture(eventName);
         mutate(data);
         const actual = verifyCompletedRun(data.run, data.page, data.expected);
         if (actual.passed !== shouldPass ||
@@ -288,32 +308,147 @@ function runCompletedWorkflowTests() {
         false, 'Incomplete');
     expectCase('malformed expected', (d) => { d.expected.id = 0; },
         false, 'Invalid expected');
+
+    // Match post-run behavior to the earlier in-job event contract.
+    for (const eventName of ['push', 'workflow_dispatch']) {
+        for (const result of ['success', 'failure', 'cancelled', 'neutral',
+            'timed_out', null]) {
+            expectCase(eventName + ' invalid dependency-review ' + result,
+                (d) => {
+                    d.page.jobs.find((j) => j.name === 'Dependency Review')
+                        .conclusion = result;
+                }, false, 'must be skipped (N/A)', eventName);
+        }
+        expectCase(eventName + ' unexpected PR number', (d) => {
+            d.expected.prNumber = 21;
+        }, false, 'Unexpected PR number', eventName);
+    }
+
+    expectCase('wrong PR number in run', (d) => {
+        d.run.pull_requests[0].number = 22;
+    }, false, 'PR number/head/base');
+    expectCase('wrong expected PR number', (d) => {
+        d.expected.prNumber = 22;
+    }, false, 'PR number/head/base');
+    for (const invalid of [undefined, null, 0, -1, 1.5, '21']) {
+        expectCase('invalid expected PR number ' + String(invalid), (d) => {
+            d.expected.prNumber = invalid;
+        }, false, 'PR number/head/base');
+    }
+    expectCase('disjoint multi-PR records', (d) => {
+        d.run.pull_requests = [
+            { number: 21, head: { sha: 'c'.repeat(40) },
+                base: { sha: base } },
+            { number: 22, head: { sha: head }, base: { sha: base } },
+        ];
+    }, false, 'PR number/head/base');
+    const matchedMultiple = fixture();
+    matchedMultiple.run.pull_requests.unshift({
+        number: 999, head: { sha: head }, base: { sha: base },
+    });
+    if (!verifyCompletedRun(matchedMultiple.run, matchedMultiple.page,
+            matchedMultiple.expected).passed) {
+        throw new Error('Matching PR rejected in multi-PR association');
+    }
+    count += 1;
+
+    for (const value of [undefined, null, 0, -2, 1.5, '1001',
+        Number.MAX_SAFE_INTEGER + 1]) {
+        expectCase('invalid numeric job ID ' + String(value), (d) => {
+            d.page.jobs[0].id = value;
+        }, false, 'numeric job ID');
+    }
+    expectCase('duplicate numeric job ID', (d) => {
+        d.page.jobs[1].id = d.page.jobs[0].id;
+    }, false, 'numeric job ID');
+
+    // Exercise the production --verify-run input handling, not a mock
+    // implementation of its decision policy.
+    function checkRecorded(label, mutate, shouldPass, diagnostic) {
+        const d = fixture();
+        mutate(d);
+        const logs = [];
+        const errors = [];
+        const output = {
+            log(message) { logs.push(message); },
+            error(message) { errors.push(message); },
+        };
+        const env = {
+            CI_GATE_RUN_JSON: JSON.stringify(d.run),
+            CI_GATE_JOBS_JSON: JSON.stringify(d.page),
+            CI_GATE_EXPECTED_HEAD_SHA: d.expected.head,
+            CI_GATE_EXPECTED_BASE_SHA: d.expected.base,
+            CI_GATE_EXPECTED_PR_NUMBER: String(d.expected.prNumber),
+            CI_GATE_EXPECTED_RUN_ID: String(d.expected.id),
+            CI_GATE_EXPECTED_RUN_ATTEMPT: String(d.expected.attempt),
+        };
+        let thrown = false;
+        try {
+            verifyRecordedRun(env, output);
+        } catch (error) {
+            thrown = true;
+            if (shouldPass || !error.message.includes(diagnostic)) {
+                throw new Error('Incorrect --verify-run error: ' + label +
+                    ' / ' + error.message);
+            }
+        }
+        if (thrown === shouldPass ||
+                (shouldPass && (logs.length !== 1 ||
+                logs[0] !== 'PASS: completed successful CI workflow, exact HEAD and jobs')) ||
+                (!shouldPass && diagnostic === 'Whole workflow' &&
+                !errors.some((x) => x.includes(diagnostic)))) {
+            throw new Error('Wrong --verify-run result: ' + label);
+        }
+        count += 1;
+    }
+    checkRecorded('real CLI path PR success', () => {}, true, '');
+    checkRecorded('real CLI path wrong PR number', (d) => {
+        d.run.pull_requests[0].number = 22;
+    }, false, 'Whole workflow');
+    checkRecorded('real CLI path duplicate ID', (d) => {
+        d.page.jobs[1].id = d.page.jobs[0].id;
+    }, false, 'Whole workflow');
+    checkRecorded('real CLI path missing ID', (d) => {
+        delete d.page.jobs[0].id;
+    }, false, 'Whole workflow');
+    checkRecorded('real CLI path cancelled overall', (d) => {
+        d.run.conclusion = 'cancelled';
+    }, false, 'Whole workflow');
+    checkRecorded('real CLI path wrong expected PR', (d) => {
+        d.expected.prNumber = 22;
+    }, false, 'Whole workflow');
     return count;
 }
 
 // Read-only verification by an operator/reviewer after the entire CI run ends.
-function verifyRecordedRun() {
-    const run = parseNeeds(process.env.CI_GATE_RUN_JSON);
-    const jobs = parseNeeds(process.env.CI_GATE_JOBS_JSON);
-    const id = process.env.CI_GATE_EXPECTED_RUN_ID || '';
-    const attempt = process.env.CI_GATE_EXPECTED_RUN_ATTEMPT || '';
+function verifyRecordedRun(env = process.env, output = console) {
+    const run = parseNeeds(env.CI_GATE_RUN_JSON);
+    const jobs = parseNeeds(env.CI_GATE_JOBS_JSON);
+    const id = env.CI_GATE_EXPECTED_RUN_ID || '';
+    const attempt = env.CI_GATE_EXPECTED_RUN_ATTEMPT || '';
+    const prNumber = env.CI_GATE_EXPECTED_PR_NUMBER || '';
     if (!/^[1-9]\d*$/.test(id) || !/^[1-9]\d*$/.test(attempt)) {
         throw new Error('Missing or invalid expected run ID/attempt');
     }
+    if ((run.event === 'pull_request' && !/^[1-9]\d*$/.test(prNumber)) ||
+            (run.event !== 'pull_request' && prNumber !== '')) {
+        throw new Error('Expected PR number invalid or not applicable');
+    }
     const expected = {
-        head: process.env.CI_GATE_EXPECTED_HEAD_SHA,
-        base: process.env.CI_GATE_EXPECTED_BASE_SHA,
+        head: env.CI_GATE_EXPECTED_HEAD_SHA,
+        base: env.CI_GATE_EXPECTED_BASE_SHA,
+        prNumber: prNumber === '' ? null : Number(prNumber),
         id: Number(id),
         attempt: Number(attempt),
     };
     const verdict = verifyCompletedRun(run, jobs, expected);
     if (!verdict.passed) {
         for (const reason of verdict.failures) {
-            console.error('[FAIL] ' + reason);
+            output.error('[FAIL] ' + reason);
         }
         throw new Error('Whole workflow acceptance rejected');
     }
-    console.log('PASS: completed successful CI workflow, exact HEAD and jobs');
+    output.log('PASS: completed successful CI workflow, exact HEAD and jobs');
 }
 
 function runTests() {
