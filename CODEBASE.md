@@ -164,6 +164,7 @@ Every path listed below is relative to the project root and reflects the verifie
 │   ├── PULL_REQUEST_TEMPLATE.md    # Standard PR checklist & hardware verification notes
 │   └── workflows/                  # GitHub Actions workflow definitions
 │       ├── ci.yml                  # PR & push CI pipeline (host validators, PlatformIO build, dependency review)
+│       ├── ci_final_run_observer.yml # READ-ONLY workflow_run observer; no status publishing (P20-S5a3 B1)
 │       └── release_ota.yml         # Tagged release pipeline (build, package, attest provenance, publish)
 ├── .gitignore                      # Git ignore rules for build artifacts and IDE cache
 ├── AGENTS.md                       # AI coding agent development guidelines and living documentation rules
@@ -344,6 +345,8 @@ Every path listed below is relative to the project root and reflects the verifie
     ├── z906_commands_metadata.json      # Centralized JSON command metadata (Single Source of Truth)
     ├── validate_command_parity.js       # Cross-layer parity verification (metadata ↔ firmware ↔ converter)
     ├── validate_ci_acceptance_gate.js    # CI prerequisites and post-run cancellation-safe verifier
+    ├── ci_final_run_observer.js           # Read-only post-run event/API observer, no status publishing
+    ├── test_ci_final_run_observer.js      # Fail-closed negative tests for exact-run/retry/PR identity
     ├── conductor_converter.mjs          # Phase 8 ESM Zigbee2MQTT External Converter (CANONICAL — ACTIVE)
     ├── test_converter.js                # Canonical suite for conductor_converter.mjs
     ├── build_ota_image.py               # ZCL OTA container packer (header + UPGRADE_IMAGE sub-element)
@@ -610,6 +613,57 @@ attempt, missing/duplicate jobs, and invalid outcome states; they
 do **not** prove live GitHub cancellation behavior. The new gate
 is not yet a required main-branch status check. No PR merge, Release,
 tag, or physical device action is authorized by this contract.
+
+### 9.4 P20-S5a3 B1: Read-Only CI Final-Run Observer
+
+Issue #22 introduces `.github/workflows/ci_final_run_observer.yml`,
+`tools/ci_final_run_observer.js`, and its host regression tests. This is
+an **observation-only** implementation. It cannot publish a commit status,
+make a final-run decision a GitHub required check, or block a PR merge.
+
+The `workflow_run` trigger observes `CI` activity (`requested`,
+`in_progress`, `completed`) from a trusted default-branch checkout.
+The observer requests only `contents: read`, `actions: read`, and
+`pull-requests: read`; it never checks out untrusted PR code, downloads
+untrusted artifacts, reads caches, executes firmware, or writes via API.
+The workflow does not become active until its definition exists on
+the repository's default branch. A green observer job is **not** proof
+of the PR's final acceptance and must never be configured as required.
+
+For same-repository pull-request runs only, the observer:
+- Re-reads the authoritative CI run (rather than trusting the webhook);
+- Compares run ID, attempt, exact HEAD, workflow, repository, and the
+  current open non-draft PR number, branch, base SHA, and default branch;
+- Requires the current main SHA to match the PR base (strict policy);
+- Reads a complete non-paginated run history for that exact HEAD and
+  rejects stale/out-of-order runs and earlier attempts;
+- On completed runs, reads the attempt-specific four jobs and reuses
+  `verifyCompletedRun()` from `validate_ci_acceptance_gate.js` as the
+  **single source of truth** for completed-run/job acceptance.
+
+`SUCCESS`, `FAILURE`, `PENDING`, `STALE`, `BLOCKED`, and `IGNORED` are
+**internal observations, not GitHub commit statuses**. A current failure
+or missing/malformed API input cannot yield `SUCCESS`. `STALE` and
+`PENDING` are not successes even if the read-only diagnostic job ends
+without an error. API exceptions fail the job. Pagination beyond
+100 matching runs is fail-closed, not silently accepted.
+
+Host tests: `node tools/test_ci_final_run_observer.js`.
+These exercise successful runs, globally cancelled runs with green
+jobs, failed/timeout/pending runs, old retries, out-of-order webhook
+activity, wrong repo/PR/HEAD/base, missing/duplicate job IDs, short
+job pages, and API errors without network calls. Running this test
+does not establish that GitHub delivered `workflow_run` events.
+
+**Not implemented / requires separate Product Owner approval:**
+`statuses: write`/`checks: write`, a trusted status publisher,
+initial pending status, safe state transitions under concurrency,
+the unique-PR-per-SHA and lost-webhook reconciliation policy, the
+`Conductor Final CI Acceptance` required context, ruleset changes,
+negative merge-veto demonstrations, and live cancellation/rerun.
+Even when B1 tests pass, automated merge enforcement remains BLOCKED.
+No Release/tag, hardware, UART, Zigbee, NVS or OTA device operations
+are authorized by this section.
 
 ---
 ## 10. Build, Test & Execution Commands

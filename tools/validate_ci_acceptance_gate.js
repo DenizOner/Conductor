@@ -569,6 +569,10 @@ function checkLive() {
     console.log('PASS: Conductor Acceptance Gate');
 }
 
+// The observer imports this same policy; importing must never execute the CLI.
+module.exports = Object.freeze({ verifyCompletedRun });
+
+if (require.main === module) {
 try {
     if (process.argv.length !== 3) {
         throw new Error('Use --test or --check');
@@ -585,4 +589,5 @@ try {
 } catch (error) {
     console.error('[FAIL] CI acceptance validation: ' + error.message);
     process.exitCode = 1;
+}
 }
