@@ -343,6 +343,7 @@ Every path listed below is relative to the project root and reflects the verifie
 └── tools/                               # External tools, metadata schemas, and validators
     ├── z906_commands_metadata.json      # Centralized JSON command metadata (Single Source of Truth)
     ├── validate_command_parity.js       # Cross-layer parity verification (metadata ↔ firmware ↔ converter)
+    ├── validate_ci_acceptance_gate.js    # CI prerequisites and post-run cancellation-safe verifier
     ├── conductor_converter.mjs          # Phase 8 ESM Zigbee2MQTT External Converter (CANONICAL — ACTIVE)
     ├── test_converter.js                # Canonical suite for conductor_converter.mjs
     ├── build_ota_image.py               # ZCL OTA container packer (header + UPGRADE_IMAGE sub-element)
@@ -554,6 +555,63 @@ The project includes 12 embedded C unit test suites verified directly on physica
 
 ---
 
+### 9.3 CI Acceptance Gate and Final-Run Verification (P20-S5a1)
+
+The PR #21 CI workflow introduces a stable **Conductor Acceptance Gate**
+that checks the `needs` results of `host-validators`, `build-firmware`,
+and `dependency-review`. For every PR, all three must equal `success`.
+For `push` and branch `workflow_dispatch` only the PR-specific dependency
+review may be `skipped`, explicitly marked **N/A**, not PASS.
+The upstream host and firmware jobs must still succeed.
+
+The gate retains `if: always()` so failures and skipped prerequisites
+are evaluated instead of implicitly skipping the gate. GitHub Actions
+can continue an `always()` job during **workflow cancellation**.
+Consequently, **green Conductor Acceptance Gate ≠ overall CI acceptance**.
+Substituting `!cancelled()` without testing can produce a skipped job
+that is treated as successful by required status-check policy.
+
+Final acceptance is deliberately a **separate read-only check after the
+entire run is completed**. `tools/validate_ci_acceptance_gate.js --verify-run`
+takes complete GitHub REST JSON for that workflow run and for its
+matching attempt-specific jobs. The caller must supply exact PR HEAD,
+PR base, PR number, run ID and attempt. The verifier requires:
+
+- `run.status == completed` and `run.conclusion == success`;
+- exact `CI` workflow and `pull_request`/allowed non-PR event;
+- matching run ID, attempt, full head SHA and **PR number, head and base**
+  within the same PR association record (non-PR: PR number N/A);
+- all four uniquely named jobs with **unique positive integer job IDs**,
+  matching run IDs, attempts, SHA,
+  `completed` status and `success` conclusion (except explicit
+  non-PR Dependency Review N/A);
+- full job page without missing/extra jobs or pagination ambiguity.
+
+Read-only verification procedure after CI is finished:
+
+1. Read `GET /repos/DenizOner/Conductor/actions/runs/<id>`.
+2. Read `GET /repos/DenizOner/Conductor/actions/runs/<id>/attempts/<attempt>/jobs?per_page=100`.
+3. Supply the JSON responses as `CI_GATE_RUN_JSON` and
+   `CI_GATE_JOBS_JSON`. Supply `CI_GATE_EXPECTED_HEAD_SHA`,
+   `CI_GATE_EXPECTED_BASE_SHA`, `CI_GATE_EXPECTED_PR_NUMBER`,
+   `CI_GATE_EXPECTED_RUN_ID` and `CI_GATE_EXPECTED_RUN_ATTEMPT` from
+   the PR's independently
+   verified exact identity, then execute
+   `node tools/validate_ci_acceptance_gate.js --verify-run`.
+   For non-PR events leave `CI_GATE_EXPECTED_PR_NUMBER` unset; the
+   Dependency Review job must be `skipped` and is reported N/A.
+4. Separately verify the PR test-merge source tree and applicable
+   CodeQL/smoke results. Preserve the exact-HEAD CI evidence.
+
+Post-completion verification **cannot run inside the same workflow**
+because its final conclusion is not yet known. The negative tests
+model cancelled runs with green prerequisite jobs, stale SHA, wrong
+attempt, missing/duplicate jobs, and invalid outcome states; they
+do **not** prove live GitHub cancellation behavior. The new gate
+is not yet a required main-branch status check. No PR merge, Release,
+tag, or physical device action is authorized by this contract.
+
+---
 ## 10. Build, Test & Execution Commands
 
 Execute all commands from the project root using relative paths:
