@@ -1,0 +1,138 @@
+# Safe rehearsal of upgraded release actions on a single PR source tree.
+# Deliberately has NO tag/push/manual trigger or release permission.
+name: OTA Release Asset Smoke (Never Publish)
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/release_ota.yml'
+      - '.github/workflows/release_asset_smoke.yml'
+      - 'tools/verify_release_assets.js'
+      - 'tools/test_release_assets.js'
+      - 'tools/release_publication_guard.js'
+      - 'tools/test_release_publication.js'
+
+permissions:
+  contents: read
+
+jobs:
+  guard-negative-cases:
+    name: Fail-Closed Release Guard Negative Tests
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'fix/release-ota-failclosed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - name: Reject missing, corrupt and incomplete release assets
+        run: |
+          node tools/test_release_assets.js
+          node tools/test_release_publication.js
+
+  build-and-transfer:
+    name: Build, Attest v4, Upload v7 (No Release)
+    needs: guard-negative-cases
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      release_digest: ${{ steps.fingerprint.outputs.release_digest }}
+    steps:
+      - name: Check out exact PR merge source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: .github/requirements.txt
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - name: Install PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r .github/requirements.txt
+      - name: Build four authentic release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          pio run -e esp32-c6-devkitc-1
+          mkdir -p dist/release
+          python tools/build_ota_image.py \
+            --input .pio/build/esp32-c6-devkitc-1/firmware.bin \
+            --output dist/1000-0906-010400aa-LogitechZ906.ota
+          node tools/generate_ota_index.js \
+            dist/1000-0906-010400aa-LogitechZ906.ota \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/v1.4.0/1000-0906-010400aa-LogitechZ906.ota" \
+            dist/index.json
+          node tools/validate_ota_image.js dist/1000-0906-010400aa-LogitechZ906.ota dist/index.json
+          cp .pio/build/esp32-c6-devkitc-1/firmware.bin dist/release/
+          cp dist/1000-0906-010400aa-LogitechZ906.ota dist/release/
+          cp dist/index.json dist/release/
+          cp tools/conductor_converter.mjs dist/release/
+          node tools/verify_release_assets.js dist/release "$GITHUB_REPOSITORY" v1.4.0
+      - name: Record the original four-asset digest
+        id: fingerprint
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(cd dist/release && sha256sum firmware.bin 1000-0906-010400aa-LogitechZ906.ota index.json conductor_converter.mjs | sha256sum | cut -d' ' -f1)"
+          echo "release_digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Attest four assets using upgraded provenance v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/release/firmware.bin
+            dist/release/1000-0906-010400aa-LogitechZ906.ota
+            dist/release/index.json
+            dist/release/conductor_converter.mjs
+      - name: Upload with upgraded artifact v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets-smoke
+          path: dist/release/
+          if-no-files-found: error
+          retention-days: 1
+
+  verify-transfer:
+    name: Download v8, Verify All Four and Provenance (No Release)
+    needs: build-and-transfer
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - name: Check out read-only validation source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - name: Download with upgraded artifact v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets-smoke
+          path: dist/release/
+          digest-mismatch: error
+      - name: Validate contents and confirm exact transferred digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tools/verify_release_assets.js dist/release "$GITHUB_REPOSITORY" v1.4.0
+          digest="$(cd dist/release && sha256sum firmware.bin 1000-0906-010400aa-LogitechZ906.ota index.json conductor_converter.mjs | sha256sum | cut -d' ' -f1)"
+          test "$digest" = "${{ needs.build-and-transfer.outputs.release_digest }}"
+      - name: Verify provenance for each downloaded file
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node tools/release_publication_guard.js attest dist/release "$GITHUB_REPOSITORY" "$GITHUB_REF" "$GITHUB_SHA" release_asset_smoke.yml
