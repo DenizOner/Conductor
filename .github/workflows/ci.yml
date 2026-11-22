@@ -104,3 +104,30 @@ jobs:
 
       - name: Dependency Review
         uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1
+
+  acceptance-gate:
+    name: Conductor Acceptance Gate
+    needs: [host-validators, build-firmware, dependency-review]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out validation source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js (Active LTS)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Exercise acceptance-gate failure cases
+        run: node tools/validate_ci_acceptance_gate.js --test
+
+      - name: Verify completed CI prerequisites
+        env:
+          CI_GATE_EVENT: ${{ github.event_name }}
+          CI_GATE_NEEDS_JSON: ${{ toJSON(needs) }}
+        run: node tools/validate_ci_acceptance_gate.js --check
