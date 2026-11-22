@@ -28,6 +28,8 @@ function fixture() {
         history: { total_count: 1, workflow_runs: [{
             id: 700, run_attempt: 2, head_sha: HEAD, event: 'pull_request',
             name: 'CI', path: '.github/workflows/ci.yml',
+            pull_requests: [{ number: 21, head: { sha: HEAD },
+                base: { sha: BASE } }],
         }] },
         jobs: { total_count: 4, jobs: [
             'Host Automated Validators',
@@ -44,13 +46,18 @@ function fixture() {
 function getter(d, broken) {
     return async (path) => {
         if (path === broken) throw new Error('Simulated GitHub API failure');
-        if (path === 'actions/runs/700') return d.run;
-        if (path === 'pulls/21') return d.pr;
-        if (path === 'git/ref/heads/main') return d.main;
+        // API GETs return snapshots, not mutable references to the backend.
+        if (path === 'actions/runs/700') return JSON.parse(JSON.stringify(d.run));
+        if (path === 'pulls/21') return JSON.parse(JSON.stringify(d.pr));
+        if (path === 'git/ref/heads/main') {
+            return JSON.parse(JSON.stringify(d.main));
+        }
         if (path === 'actions/runs?event=pull_request&head_sha=' +
-                HEAD + '&per_page=100') return d.history;
+                HEAD + '&per_page=100') {
+            return JSON.parse(JSON.stringify(d.history));
+        }
         if (path === 'actions/runs/700/attempts/2/jobs?per_page=100') {
-            return d.jobs;
+            return JSON.parse(JSON.stringify(d.jobs));
         }
         throw new Error('Unexpected API path: ' + path);
     };
@@ -93,7 +100,9 @@ async function runTests() {
         d.history.workflow_runs.push({
             id: 701, run_attempt: 1, head_sha: HEAD,
             name: 'CI', path: '.github/workflows/ci.yml',
-            event: 'pull_request',
+            event: 'pull_request', pull_requests: [{
+                number: 21, head: { sha: HEAD }, base: { sha: BASE },
+            }],
         });
     }, 'STALE');
     await check('new CI attempt', (d) => {
@@ -155,6 +164,147 @@ async function runTests() {
         await check(name, mutate, 'FAILURE');
     }
     await check('push ignored', (d) => { d.run.event = 'push'; }, 'IGNORED');
+
+    // A different PR on the same exact HEAD must not supersede this PR.
+    function otherPrRun(baseSha = BASE) {
+        return { id: 701, run_attempt: 1, head_sha: HEAD,
+            name: 'CI', path: '.github/workflows/ci.yml',
+            event: 'pull_request', pull_requests: [{
+                number: 24, head: { sha: HEAD }, base: { sha: baseSha },
+            }] };
+    }
+    await check('same HEAD other PR different base ignored', (d) => {
+        d.history.total_count = 2;
+        d.history.workflow_runs.push(otherPrRun('c'.repeat(40)));
+    }, 'SUCCESS');
+    await check('same HEAD other PR identical base ignored', (d) => {
+        d.history.total_count = 2;
+        d.history.workflow_runs.push(otherPrRun());
+    }, 'SUCCESS');
+    await check('same HEAD other PR rerun ignored', (d) => {
+        d.history.total_count = 2;
+        d.history.workflow_runs.push({ ...otherPrRun(), run_attempt: 9 });
+    }, 'SUCCESS');
+    await check('same PR newer CI and different base supersedes', (d) => {
+        d.history.total_count = 2;
+        d.history.workflow_runs.push({
+            ...otherPrRun('c'.repeat(40)),
+            pull_requests: [{ number: 21, head: { sha: HEAD },
+                base: { sha: 'c'.repeat(40) } }],
+        });
+    }, 'STALE');
+    await check('history association missing', (d) => {
+        delete d.history.workflow_runs[0].pull_requests;
+    }, 'BLOCKED');
+    await check('history association empty', (d) => {
+        d.history.workflow_runs[0].pull_requests = [];
+    }, 'BLOCKED');
+    await check('history association null entry', (d) => {
+        d.history.workflow_runs[0].pull_requests = [null];
+    }, 'BLOCKED');
+    await check('history association malformed head', (d) => {
+        d.history.workflow_runs[0].pull_requests[0].head = null;
+    }, 'BLOCKED');
+    await check('history association malformed base', (d) => {
+        d.history.workflow_runs[0].pull_requests[0].base = null;
+    }, 'BLOCKED');
+    await check('history association ambiguous', (d) => {
+        d.history.workflow_runs[0].pull_requests.push(
+            otherPrRun().pull_requests[0]);
+    }, 'BLOCKED');
+    await check('history association wrong number', (d) => {
+        d.history.workflow_runs[0].pull_requests[0].number = 24;
+    }, 'BLOCKED');
+    await check('history association wrong base', (d) => {
+        d.history.workflow_runs[0].pull_requests[0].base.sha =
+            'c'.repeat(40);
+    }, 'BLOCKED');
+    await check('history other PR association malformed', (d) => {
+        d.history.total_count = 2;
+        d.history.workflow_runs.push({
+            ...otherPrRun(), pull_requests: [],
+        });
+    }, 'BLOCKED');
+
+    // Change the backend after the first PR/main read but before the
+    // final independent GETs. Snapshots in getter() remain immutable.
+    async function race(name, mutate, expected) {
+        const d = fixture();
+        let changed = false;
+        const get = getter(d);
+        const verdict = await observe(d.event, REPO, async (path) => {
+            if (!changed && path.includes('/attempts/2/jobs')) {
+                changed = true;
+                const result = await get(path);
+                mutate(d);
+                return result;
+            }
+            return get(path);
+        });
+        if (!changed || verdict.state !== expected) {
+            throw new Error('Race ' + name + ' expected ' + expected +
+                ' but received ' + JSON.stringify(verdict));
+        }
+        count += 1;
+    }
+    await race('PR becomes draft', (d) => {
+        d.pr.draft = true;
+    }, 'BLOCKED');
+    await race('PR closed', (d) => {
+        d.pr.state = 'closed';
+    }, 'BLOCKED');
+    await race('PR HEAD updated', (d) => {
+        d.pr.head.sha = 'c'.repeat(40);
+    }, 'BLOCKED');
+    await race('PR base changed', (d) => {
+        d.pr.base.sha = 'c'.repeat(40);
+    }, 'BLOCKED');
+    await race('main changes', (d) => {
+        d.main.object.sha = 'c'.repeat(40);
+    }, 'BLOCKED');
+    await race('CI retry begins', (d) => {
+        d.run.run_attempt = 3;
+    }, 'STALE');
+    await race('whole run becomes cancelled', (d) => {
+        d.run.conclusion = 'cancelled';
+    }, 'FAILURE');
+    await race('newer same-PR CI run arrives', (d) => {
+        d.history.total_count = 2;
+        d.history.workflow_runs.push({
+            ...otherPrRun(), pull_requests: [{
+                number: 21, head: { sha: HEAD }, base: { sha: BASE },
+            }],
+        });
+    }, 'STALE');
+    await race('newer other-PR CI run arrives', (d) => {
+        d.history.total_count = 2;
+        d.history.workflow_runs.push(otherPrRun());
+    }, 'SUCCESS');
+
+    // A failure on the second fetch of any final identity must not pass.
+    for (const endpoint of [
+        'pulls/21', 'git/ref/heads/main', 'actions/runs/700',
+        'actions/runs?event=pull_request&head_sha=' +
+            HEAD + '&per_page=100',
+    ]) {
+        const d = fixture();
+        let countForPath = 0;
+        let rejected = false;
+        try {
+            await observe(d.event, REPO, async (path) => {
+                if (path === endpoint && ++countForPath === 2) {
+                    throw new Error('Final API read rejected');
+                }
+                return getter(d)(path);
+            });
+        } catch (error) {
+            rejected = error.message === 'Final API read rejected';
+        }
+        if (!rejected || countForPath !== 2) {
+            throw new Error('Final API error accepted: ' + endpoint);
+        }
+        count += 1;
+    }
     const endpoints = [
         'actions/runs/700', 'pulls/21', 'git/ref/heads/main',
         'actions/runs?event=pull_request&head_sha=' +

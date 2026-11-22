@@ -635,11 +635,17 @@ For same-repository pull-request runs only, the observer:
 - Compares run ID, attempt, exact HEAD, workflow, repository, and the
   current open non-draft PR number, branch, base SHA, and default branch;
 - Requires the current main SHA to match the PR base (strict policy);
-- Reads a complete non-paginated run history for that exact HEAD and
-  rejects stale/out-of-order runs and earlier attempts;
+- Reads complete non-paginated CI history for that exact HEAD, **scoped
+  to this PR number**; other PRs sharing the same SHA do not cause false
+  `STALE`, but missing/ambiguous PR associations fail closed;
+- Rejects stale/out-of-order runs and earlier attempts belonging to this PR;
 - On completed runs, reads the attempt-specific four jobs and reuses
   `verifyCompletedRun()` from `validate_ci_acceptance_gate.js` as the
-  **single source of truth** for completed-run/job acceptance.
+  **single source of truth** for completed-run/job acceptance;
+- Before a `SUCCESS` observation, re-reads the current PR/main,
+  completed run and same-PR CI history; a changed draft/HEAD/base,
+  canceled run or newer attempt cannot reuse an earlier positive read.
+  This narrows, but **does not eliminate**, the REST TOCTOU race.
 
 `SUCCESS`, `FAILURE`, `PENDING`, `STALE`, `BLOCKED`, and `IGNORED` are
 **internal observations, not GitHub commit statuses**. A current failure
@@ -652,14 +658,15 @@ Host tests: `node tools/test_ci_final_run_observer.js`.
 These exercise successful runs, globally cancelled runs with green
 jobs, failed/timeout/pending runs, old retries, out-of-order webhook
 activity, wrong repo/PR/HEAD/base, missing/duplicate job IDs, short
-job pages, and API errors without network calls. Running this test
+job pages, unrelated PRs at the same SHA, final-read PR/base/attempt
+races, and API errors without network calls. Running this test
 does not establish that GitHub delivered `workflow_run` events.
 
 **Not implemented / requires separate Product Owner approval:**
 `statuses: write`/`checks: write`, a trusted status publisher,
 initial pending status, safe state transitions under concurrency,
-the unique-PR-per-SHA and lost-webhook reconciliation policy, the
-`Conductor Final CI Acceptance` required context, ruleset changes,
+the lost-webhook/reconciliation and atomic publisher transition policy,
+the `Conductor Final CI Acceptance` required context, ruleset changes,
 negative merge-veto demonstrations, and live cancellation/rerun.
 Even when B1 tests pass, automated merge enforcement remains BLOCKED.
 No Release/tag, hardware, UART, Zigbee, NVS or OTA device operations
