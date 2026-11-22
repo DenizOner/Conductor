@@ -126,8 +126,10 @@ jobs:
       - name: Exercise acceptance-gate failure cases
         run: node tools/validate_ci_acceptance_gate.js --test
 
-      - name: Verify completed CI prerequisites
+      - name: Verify CI prerequisites (not the final workflow verdict)
         env:
           CI_GATE_EVENT: ${{ github.event_name }}
           CI_GATE_NEEDS_JSON: ${{ toJSON(needs) }}
-        run: node tools/validate_ci_acceptance_gate.js --check
+        run: |
+          node tools/validate_ci_acceptance_gate.js --check
+          echo "::notice::Gate success covers prerequisites only. Verify final workflow run status, attempt and exact HEAD with --verify-run after completion."
