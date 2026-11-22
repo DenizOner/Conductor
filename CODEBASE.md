@@ -156,7 +156,7 @@ Every path listed below is relative to the project root and reflects the verifie
 │   ├── SECURITY.md                 # Security policy & Private Vulnerability Reporting instructions
 │   ├── dependabot.yml              # Dependabot configuration (github-actions & pip schedules)
 │   ├── release.yml                 # Automated release notes changelog categories
-│   ├── requirements.txt            # Pinned build-time Python dependencies (platformio==6.1.16)
+│   ├── requirements.txt            # Pinned build-time Python dependencies (platformio==6.2.0)
 │   ├── ISSUE_TEMPLATE/             # Structured GitHub Issue forms
 │   │   ├── bug_report.yml          # Bug report form with component classification
 │   │   ├── config.yml              # Security redirection & discussions contact links
