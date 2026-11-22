@@ -63,7 +63,7 @@ function evaluate(eventName, needs) {
             messages.push('[N/A] ' + id + ': only runs for pull requests');
         } else if (result === 'success') {
             if (id === 'dependency-review' && eventName !== 'pull_request') {
-                failures.push('Dependency Review unexpectedly ran outside a PR');
+                failures.push('dependency-review unexpectedly ran outside a PR');
             } else {
                 messages.push('[PASS] ' + id);
             }
@@ -140,7 +140,7 @@ function runTests() {
             const needs = fixture();
             needs['dependency-review'].result = result;
             expectCase(eventName + ' non-PR Dependency Review ' + result,
-                eventName, needs, false, 'Dependency Review');
+                eventName, needs, false, 'dependency-review');
         }
     }
 
