@@ -387,7 +387,8 @@ function runCompletedWorkflowTests() {
             verifyRecordedRun(env, output);
         } catch (error) {
             thrown = true;
-            if (shouldPass || !error.message.includes(diagnostic)) {
+            if (shouldPass ||
+                    !error.message.includes('Whole workflow acceptance rejected')) {
                 throw new Error('Incorrect --verify-run error: ' + label +
                     ' / ' + error.message);
             }
@@ -395,8 +396,7 @@ function runCompletedWorkflowTests() {
         if (thrown === shouldPass ||
                 (shouldPass && (logs.length !== 1 ||
                 logs[0] !== 'PASS: completed successful CI workflow, exact HEAD and jobs')) ||
-                (!shouldPass && diagnostic === 'Whole workflow' &&
-                !errors.some((x) => x.includes(diagnostic)))) {
+                (!shouldPass && !errors.some((x) => x.includes(diagnostic)))) {
             throw new Error('Wrong --verify-run result: ' + label);
         }
         count += 1;
@@ -404,19 +404,19 @@ function runCompletedWorkflowTests() {
     checkRecorded('real CLI path PR success', () => {}, true, '');
     checkRecorded('real CLI path wrong PR number', (d) => {
         d.run.pull_requests[0].number = 22;
-    }, false, 'Whole workflow');
+    }, false, 'PR number/head/base');
     checkRecorded('real CLI path duplicate ID', (d) => {
         d.page.jobs[1].id = d.page.jobs[0].id;
-    }, false, 'Whole workflow');
+    }, false, 'numeric job ID');
     checkRecorded('real CLI path missing ID', (d) => {
         delete d.page.jobs[0].id;
-    }, false, 'Whole workflow');
+    }, false, 'numeric job ID');
     checkRecorded('real CLI path cancelled overall', (d) => {
         d.run.conclusion = 'cancelled';
-    }, false, 'Whole workflow');
+    }, false, 'Whole workflow run did not complete successfully');
     checkRecorded('real CLI path wrong expected PR', (d) => {
         d.expected.prNumber = 22;
-    }, false, 'Whole workflow');
+    }, false, 'PR number/head/base');
     return count;
 }
 
