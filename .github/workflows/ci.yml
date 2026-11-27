@@ -38,6 +38,9 @@ jobs:
           node tools/test_converter.js
           node tools/validate_command_parity.js
 
+      - name: Exercise read-only final-run observer failure cases
+        run: node tools/test_ci_final_run_observer.js
+
   build-firmware:
     name: Build Firmware Binary & Validate OTA
     runs-on: ubuntu-latest
