@@ -71,6 +71,11 @@ bool nvs_manager_clear_zb_net_info(void);
  */
 bool nvs_manager_get_cmd_verifier_enabled(bool *out_enabled);
 
+/** @brief Read-only OTA NVS health: missing optional key is healthy;
+ * genuine open/read/type errors are not. Never erases or writes NVS.
+ */
+bool nvs_manager_check_read_health(void);
+
 /**
  * @brief Saves the persistent Command Verifier enabled status to NVS with write deduplication.
  * @param enabled Desired state (true = enabled, false = disabled).

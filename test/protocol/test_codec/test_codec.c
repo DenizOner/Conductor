@@ -18,6 +18,7 @@
 #include "z906_codec.h"
 /* Include protocol command and constants header */
 #include "z906_commands.h"
+#include <string.h>
 
 /**
  * @brief Set up test fixtures before each test execution.
@@ -419,11 +420,64 @@ void test_z906_codec_temperature_valid_zero_celsius_accepted(void)
 /**
  * @brief Entry point for Unity test suite execution.
  */
+/** @brief A checksum-correct but extended 21-byte CONFIG must be rejected. */
+void test_z906_codec_reject_extended_config(void)
+{
+    const uint8_t frame_payload[21] = {
+        10, 21, 21, 21, 0, 0, 0, 0, 0, 0, 3, 0,
+        0, 0, 6, 1, 3, 0, 0, 0, 0
+    };
+    uint8_t frame[25] = { 0xAA, 0x0A, 21 };
+    memcpy(&frame[3], frame_payload, sizeof(frame_payload));
+    frame[24] = z906_codec_calc_frame_lrc(0x0A, 21, frame_payload, 21);
+    z906_codec_ctx_t ctx;
+    z906_decoded_packet_t decoded;
+    z906_codec_init(&ctx);
+    for (size_t i = 0; i < sizeof(frame) - 1; i++) {
+        TEST_ASSERT_EQUAL(Z906_PARSE_RESULT_IN_PROGRESS,
+                          z906_codec_feed_byte(&ctx, frame[i], &decoded));
+    }
+    TEST_ASSERT_EQUAL(Z906_PARSE_RESULT_RESYNC_DROP,
+                      z906_codec_feed_byte(&ctx, frame[24], &decoded));
+    TEST_ASSERT_FALSE(z906_codec_is_frame_in_progress(&ctx));
+}
+
+/** @brief Invalid physical CONFIG fields cannot be legitimized by recomputed LRC. */
+void test_z906_codec_reject_semantically_invalid_config(void)
+{
+    static const uint8_t canonical[20] = {
+        0x0A, 0x15, 0x15, 0x15, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x03, 0x00,
+        0x00, 0x00, 0x06, 0x01, 0x03, 0x00,
+        0x00, 0x00
+    };
+    const uint8_t bad_indices[] = { 0, 1, 2, 3, 4, 5, 6, 17, 19 };
+    const uint8_t bad_values[]  = { 44, 44, 44, 44, 6, 2, 4, 2, 2 };
+    for (size_t n = 0; n < sizeof(bad_indices); n++) {
+        uint8_t data[20];
+        memcpy(data, canonical, sizeof(data));
+        data[bad_indices[n]] = bad_values[n];
+        uint8_t frame[24] = { 0xAA, 0x0A, 0x14 };
+        memcpy(&frame[3], data, 20);
+        frame[23] = z906_codec_calc_frame_lrc(0x0A, 20, data, 20);
+        z906_codec_ctx_t ctx;
+        z906_decoded_packet_t decoded;
+        z906_codec_init(&ctx);
+        for (size_t i = 0; i < sizeof(frame) - 1; i++) {
+            (void)z906_codec_feed_byte(&ctx, frame[i], &decoded);
+        }
+        TEST_ASSERT_EQUAL(Z906_PARSE_RESULT_RESYNC_DROP,
+                          z906_codec_feed_byte(&ctx, frame[23], &decoded));
+    }
+}
+
 int runUnityTests(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_z906_lrc_canonical_formula);
     RUN_TEST(test_z906_codec_parse_canonical_amp_config);
+    RUN_TEST(test_z906_codec_reject_extended_config);
+    RUN_TEST(test_z906_codec_reject_semantically_invalid_config);
     RUN_TEST(test_z906_codec_reject_corrupted_checksum);
     RUN_TEST(test_z906_codec_standby_flag_extraction);
     RUN_TEST(test_z906_codec_decode_temperature);

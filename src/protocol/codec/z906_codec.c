@@ -113,6 +113,25 @@ z906_parse_result_t z906_codec_feed_byte(z906_codec_ctx_t *ctx, uint8_t byte, z9
                 return Z906_PARSE_RESULT_RESYNC_DROP;
             }
 
+            /* The amplifier CONFIG reply is AA 0A 14 and has exactly 20 data
+             * bytes. Valid LRC alone cannot make extra bytes or out-of-range
+             * physical fields trustworthy. Consume the full frame before drop
+             * so no payload byte is reinterpreted as a standalone command. */
+            if (ctx->type == Z906_MB_CONFIG_AMP) {
+                if (ctx->bytes_read != 20 ||
+                    ctx->buffer[0] > 43 || ctx->buffer[1] > 43 ||
+                    ctx->buffer[2] > 43 || ctx->buffer[3] > 43 ||
+                    ctx->buffer[4] > 5 || ctx->buffer[5] > 1 ||
+                    ctx->buffer[17] > 1 || ctx->buffer[19] > 1) {
+                    return Z906_PARSE_RESULT_RESYNC_DROP;
+                }
+                for (int i = 6; i < 12; i++) {
+                    if (ctx->buffer[i] > 3) {
+                        return Z906_PARSE_RESULT_RESYNC_DROP;
+                    }
+                }
+            }
+
             if (out_packet == NULL) {
                 return Z906_PARSE_RESULT_FRAME_COMPLETE;
             }
@@ -120,7 +139,7 @@ z906_parse_result_t z906_codec_feed_byte(z906_codec_ctx_t *ctx, uint8_t byte, z9
             memset(out_packet, 0, sizeof(z906_decoded_packet_t));
 
             /* 1. Decode 20-byte amplifier configuration packet (Type 0x0A, Length 0x14) */
-            if (ctx->type == Z906_MB_CONFIG_AMP && ctx->bytes_read >= 20) {
+            if (ctx->type == Z906_MB_CONFIG_AMP && ctx->bytes_read == 20) {
                 out_packet->type = Z906_PACKET_CONFIG;
                 out_packet->data.config.volume                = ctx->buffer[0];
                 out_packet->data.config.volume_rear           = ctx->buffer[1];

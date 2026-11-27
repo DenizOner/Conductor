@@ -25,6 +25,15 @@ typedef struct {
     bool z906_comm_healthy;         /**< Z906 UART HAL and Command Verifier active without fatal errors */
 } ota_health_criteria_t;
 
+typedef enum {
+    OTA_HEALTH_RECOVERY_NONE = 0,
+    OTA_HEALTH_RECOVERY_REQUESTED,
+    OTA_HEALTH_RECOVERY_NO_FALLBACK,
+    OTA_HEALTH_RECOVERY_ROLLBACK_ERROR,
+    OTA_HEALTH_RECOVERY_ROLLBACK_QUEUED,
+    OTA_HEALTH_RECOVERY_REQUEST_TOO_LATE
+} ota_health_recovery_state_t;
+
 #define OTA_CRITERION_SCHEDULER   (1u << 0)
 #define OTA_CRITERION_TWDT        (1u << 1)
 #define OTA_CRITERION_NVS         (1u << 2)
@@ -45,7 +54,7 @@ bool ota_health_init(void);
  * If all criteria pass, commits firmware with esp_ota_mark_app_valid_cancel_rollback().
  * If any fatal criteria fail or timeout expires with unfulfilled criteria,
  * executes automatic rollback with esp_ota_mark_app_invalid_rollback_and_reboot().
- * @param elapsed_sec Seconds elapsed since last cycle.
+ * @param elapsed_sec Legacy caller hint; real time is measured by esp_timer_get_time().
  */
 void ota_health_process_cycle(uint32_t elapsed_sec);
 
@@ -60,6 +69,18 @@ bool ota_health_is_pending_verify(void);
  * @param reason Reason description string for logging.
  */
 void ota_health_trigger_rollback(const char *reason);
+
+/** @brief CLI operator rollback: records request provenance without changing health proof. */
+void ota_health_trigger_manual_rollback(const char *reason);
+
+/** @brief True only for operator recovery, without a health or SDK failure. */
+bool ota_health_was_manual_only_rollback(void);
+/** @brief True when the ESP-IDF SDK refused mark-valid. */
+bool ota_health_was_sdk_mark_valid_failed(void);
+
+/** @brief Read-only recovery diagnostic (does not initiate any recovery). */
+ota_health_recovery_state_t ota_health_get_recovery_state(void);
+const char *ota_health_recovery_state_str(ota_health_recovery_state_t state);
 
 /**
  * @brief Retrieves current health criteria status snapshot.
@@ -87,6 +108,9 @@ void ota_health_report_nvs_ok(void);
  * @brief Mark the TWDT criterion as successfully verified.
  */
 void ota_health_report_twdt_ok(void);
+
+/** @brief Reports only the telemetry owner task\x27s actual TWDT feed outcome. */
+void ota_health_report_twdt_observation(bool fed);
 
 /**
  * @brief Mark the Zigbee criterion as successfully verified.
@@ -116,9 +140,29 @@ bool ota_health_is_validated(void);
 typedef void (*ota_rollback_fn_t)(const char *reason);
 typedef esp_err_t (*ota_mark_valid_fn_t)(void);
 
+typedef int64_t (*ota_health_time_fn_t)(void);
+typedef bool (*ota_health_bool_fn_t)(void);
+typedef void (*ota_health_void_fn_t)(void);
+
 void ota_health_set_pending_verify_for_test(bool pending);
+void ota_health_set_time_fn_for_test(ota_health_time_fn_t fn);
+void ota_health_set_z906_status_time_fn_for_test(ota_health_time_fn_t fn);
+void ota_health_set_zigbee_ready_fn_for_test(ota_health_bool_fn_t fn);
+void ota_health_set_nvs_healthy_fn_for_test(ota_health_bool_fn_t fn);
+void ota_health_set_twdt_healthy_fn_for_test(ota_health_bool_fn_t fn);
+void ota_health_set_fallback_available_fn_for_test(ota_health_bool_fn_t fn);
 void ota_health_set_rollback_fn_for_test(ota_rollback_fn_t fn);
 void ota_health_set_mark_valid_fn_for_test(ota_mark_valid_fn_t fn);
+/** @brief Host/Unity-only interleaving hook after PASS, before final OTA admission. */
+void ota_health_set_before_final_admission_fn_for_test(ota_health_void_fn_t fn);
+/** @brief Test interleaving after final proof but before SDK handoff claim. */
+void ota_health_set_before_sdk_handoff_fn_for_test(ota_health_void_fn_t fn);
+/** Host/Unity: preempt after earlier RX proof, BEFORE the atomic software claim. */
+void ota_health_set_before_atomic_claim_fn_for_test(ota_health_void_fn_t fn);
+/** Host/Unity: preempt AFTER the atomic claim, before the SDK mock enters. */
+void ota_health_set_after_atomic_claim_fn_for_test(ota_health_void_fn_t fn);
+/** Host/Unity: clock/preemption while state mutex is held, before health mux. */
+void ota_health_set_before_locked_claim_critical_fn_for_test(ota_health_void_fn_t fn);
 void ota_health_reset_for_test(void);
 
 #ifdef __cplusplus

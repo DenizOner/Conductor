@@ -14,6 +14,7 @@
 #include "z906_state.h"
 /* Include project configuration header */
 #include "config.h"
+#include "esp_timer.h"
 /* FreeRTOS headers for concurrent-writer test */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -39,6 +40,218 @@ void tearDown(void)
 /**
  * @brief Tests default initialization state.
  */
+/** @brief Verified CONFIG timestamps are invalidated on cable loss. */
+void test_main_status_timestamp_invalidated_on_cable_loss(void)
+{
+    TEST_ASSERT_EQUAL_INT64(0, z906_state_get_main_status_time_us());
+    z906_state_set_cable_status(true);
+    z906_state_set_main_valid(true);
+    int64_t confirmed_at = z906_state_get_main_status_time_us();
+    TEST_ASSERT_TRUE(confirmed_at > 0);
+    TEST_ASSERT_TRUE(confirmed_at <= esp_timer_get_time());
+    z906_state_set_cable_status(false);
+    TEST_ASSERT_EQUAL_INT64(0, z906_state_get_main_status_time_us());
+}
+
+/** @brief A reconnect or queued validity call must never reuse the prior cable epoch. */
+void test_main_status_requires_current_cable_epoch(void)
+{
+    z906_state_set_main_valid(true);
+    TEST_ASSERT_FALSE(z906_state_is_main_valid());
+
+    z906_state_set_cable_status(true);
+    z906_state_set_main_valid(true);
+    TEST_ASSERT_TRUE(z906_state_is_main_valid());
+
+    z906_state_set_cable_status(false);
+    z906_state_set_main_valid(true); /* Simulated late queued CONFIG frame. */
+    TEST_ASSERT_FALSE(z906_state_is_main_valid());
+
+    z906_state_set_cable_status(true);
+    TEST_ASSERT_FALSE(z906_state_is_main_valid());
+    TEST_ASSERT_EQUAL_INT64(0, z906_state_get_main_status_time_us());
+}
+
+/** @brief OTA response evidence is distinct from a spontaneous CONFIG frame. */
+void test_matched_status_requires_live_query_and_cable(void)
+{
+    z906_state_set_cable_status(true);
+    z906_state_set_main_valid(true);
+    TEST_ASSERT_EQUAL_INT64(0, z906_state_get_matched_status_reply_time_us());
+
+    z906_state_note_matched_status_reply(esp_timer_get_time());
+    TEST_ASSERT_TRUE(z906_state_get_matched_status_reply_time_us() > 0);
+
+    z906_state_set_cable_status(false);
+    TEST_ASSERT_EQUAL_INT64(0, z906_state_get_matched_status_reply_time_us());
+
+    z906_state_set_cable_status(true);
+    TEST_ASSERT_EQUAL_INT64(0, z906_state_get_matched_status_reply_time_us());
+}
+
+/** @brief No delayed CONFIG may revive an older ADC cable epoch. */
+void test_cable_epoch_confirm_requires_current_connection(void)
+{
+    uint32_t boot_epoch = z906_state_get_cable_epoch();
+    TEST_ASSERT_FALSE(z906_state_confirm_main_for_epoch(boot_epoch));
+
+    z906_state_set_cable_status(true);
+    uint32_t epoch_one = z906_state_get_cable_epoch();
+    TEST_ASSERT_EQUAL_UINT32(boot_epoch + 1u, epoch_one);
+    TEST_ASSERT_FALSE(z906_state_confirm_main_for_epoch(boot_epoch));
+    TEST_ASSERT_TRUE(z906_state_confirm_main_for_epoch(epoch_one));
+    TEST_ASSERT_TRUE(z906_state_is_main_valid());
+
+    z906_state_set_cable_status(false);
+    uint32_t epoch_two = z906_state_get_cable_epoch();
+    TEST_ASSERT_EQUAL_UINT32(epoch_one + 1u, epoch_two);
+    TEST_ASSERT_FALSE(z906_state_confirm_main_for_epoch(epoch_one));
+    TEST_ASSERT_FALSE(z906_state_is_main_valid());
+
+    z906_state_set_cable_status(true);
+    uint32_t epoch_three = z906_state_get_cable_epoch();
+    TEST_ASSERT_EQUAL_UINT32(epoch_two + 1u, epoch_three);
+    TEST_ASSERT_FALSE(z906_state_confirm_main_for_epoch(epoch_one));
+    TEST_ASSERT_EQUAL_INT64(0, z906_state_get_matched_status_reply_time_us());
+    TEST_ASSERT_FALSE(z906_state_is_main_valid());
+    TEST_ASSERT_TRUE(z906_state_confirm_main_for_epoch(epoch_three));
+}
+
+/** @brief Atomic CONFIG update must reject stale epochs without touching fields. */
+void test_config_atomic_commit_rejects_old_epoch_without_state_changes(void)
+{
+    z906_state_set_cable_status(true);
+    uint32_t old_epoch = z906_state_get_cable_epoch();
+    z906_state_set_cable_status(false);
+    z906_state_set_cable_status(true);
+    uint32_t current_epoch = z906_state_get_cable_epoch();
+
+    z906_state_t before;
+    z906_state_get(&before);
+    z906_state_t proposed = { 0 };
+    proposed.power = true;
+    proposed.volume = 31;
+    proposed.volume_bass = 21;
+    proposed.volume_center = 20;
+    proposed.volume_rear = 19;
+    proposed.input = Z906_INPUT_OPTICAL_1;
+    proposed.effect = Z906_EFFECT_3D;
+    proposed.mute = true;
+    proposed.digital_signal_status = 0x17;
+    proposed.auto_standby_enabled = true;
+
+    TEST_ASSERT_FALSE(z906_state_apply_verified_config_for_epoch(old_epoch, z906_state_get_amp_rx_stream_epoch(), &proposed));
+    z906_state_t after;
+    z906_state_get(&after);
+    TEST_ASSERT_EQUAL_UINT8(before.volume, after.volume);
+    TEST_ASSERT_EQUAL(before.input, after.input);
+    TEST_ASSERT_EQUAL(before.power, after.power);
+    TEST_ASSERT_FALSE(z906_state_is_main_valid());
+
+    proposed.volume = 44; /* Wrong physical bounds must be rejected. */
+    TEST_ASSERT_FALSE(z906_state_apply_verified_config_for_epoch(current_epoch, z906_state_get_amp_rx_stream_epoch(), &proposed));
+    proposed.volume = 31;
+    TEST_ASSERT_TRUE(z906_state_apply_verified_config_for_epoch(current_epoch, z906_state_get_amp_rx_stream_epoch(), &proposed));
+    z906_state_get(&after);
+    TEST_ASSERT_TRUE(z906_state_is_main_valid());
+    TEST_ASSERT_EQUAL_UINT8(31, after.volume);
+    TEST_ASSERT_EQUAL_UINT8(21, after.volume_bass);
+    TEST_ASSERT_EQUAL_UINT8(20, after.volume_center);
+    TEST_ASSERT_EQUAL_UINT8(19, after.volume_rear);
+    TEST_ASSERT_EQUAL(Z906_INPUT_OPTICAL_1, after.input);
+    TEST_ASSERT_EQUAL(Z906_EFFECT_3D, after.effect);
+    TEST_ASSERT_TRUE(after.power);
+    TEST_ASSERT_TRUE(after.mute);
+    TEST_ASSERT_TRUE(after.auto_standby_enabled);
+    TEST_ASSERT_EQUAL_HEX8(0x17, after.digital_signal_status);
+}
+
+/** @brief Last dropped RX event must revoke OTA proof without another byte. */
+void test_last_amp_rx_drop_invalidates_matched_status_immediately(void)
+{
+    z906_state_set_cable_status(true);
+    uint32_t cable = z906_state_get_cable_epoch();
+    uint32_t stream = z906_state_get_amp_rx_stream_epoch();
+    z906_state_t frame = { 0 };
+    frame.volume = 10;
+    frame.volume_bass = 10;
+    frame.volume_center = 10;
+    frame.volume_rear = 10;
+    frame.input = Z906_INPUT_OPTICAL_1;
+    frame.effect = Z906_EFFECT_3D;
+    TEST_ASSERT_TRUE(z906_state_apply_verified_config_for_epoch(cable, stream, &frame));
+    z906_state_note_matched_status_reply(esp_timer_get_time());
+    TEST_ASSERT_TRUE(z906_state_get_matched_status_reply_time_us() > 0);
+    uint32_t after_loss = z906_state_note_amp_rx_loss(cable);
+    TEST_ASSERT_EQUAL_UINT32(stream + 1, after_loss);
+    TEST_ASSERT_FALSE(z906_state_is_main_valid());
+    TEST_ASSERT_EQUAL_INT64(0, z906_state_get_matched_status_reply_time_us());
+    TEST_ASSERT_EQUAL_INT64(0, z906_state_get_main_status_time_us());
+    TEST_ASSERT_FALSE(z906_state_apply_verified_config_for_epoch(cable, stream, &frame));
+    TEST_ASSERT_TRUE(z906_state_apply_verified_config_for_epoch(cable, after_loss, &frame));
+}
+
+void test_standalone_echo_requires_current_cable_and_rx_epochs(void)
+{
+    z906_state_set_cable_status(true);
+    uint32_t cable = z906_state_get_cable_epoch();
+    uint32_t stream = z906_state_get_amp_rx_stream_epoch();
+    TEST_ASSERT_FALSE(z906_state_apply_amp_echo_for_generations(cable - 1, stream, 0x20));
+    TEST_ASSERT_FALSE(z906_state_apply_amp_echo_for_generations(cable, stream - 1, 0x36));
+    z906_state_t before;
+    z906_state_get(&before);
+    TEST_ASSERT_FALSE(before.mute);
+    TEST_ASSERT_FALSE(before.power);
+    TEST_ASSERT_TRUE(z906_state_apply_amp_echo_for_generations(cable, stream, 0x20));
+    TEST_ASSERT_TRUE(z906_state_apply_amp_echo_for_generations(cable, stream, 0x08));
+    z906_state_t after;
+    z906_state_get(&after);
+    TEST_ASSERT_TRUE(after.mute);
+    TEST_ASSERT_EQUAL_UINT8(before.volume + 1, after.volume);
+    (void)z906_state_note_amp_rx_loss(cable);
+    TEST_ASSERT_FALSE(z906_state_apply_amp_echo_for_generations(cable, stream, 0x21));
+    z906_state_get(&after);
+    TEST_ASSERT_TRUE(after.mute);
+}
+
+/** @brief A stale temperature frame cannot revive validity after RX drop. */
+void test_temperature_only_drop_notifies_and_rejects_stale_telemetry(void)
+{
+    z906_state_set_cable_status(true);
+    uint32_t cable = z906_state_get_cable_epoch();
+    uint32_t rx = z906_state_get_amp_rx_stream_epoch();
+    const int8_t temperatures[3] = { 21, 22, 23 };
+
+    TEST_ASSERT_TRUE(z906_state_apply_temperature_for_generations(cable, rx, temperatures));
+    z906_state_t before;
+    z906_state_get(&before);
+    TEST_ASSERT_TRUE(before.temp_valid);
+    TEST_ASSERT_FALSE(before.main_state_valid);
+
+    uint32_t next = z906_state_note_amp_rx_loss(cable);
+    z906_state_t invalid;
+    z906_state_get(&invalid);
+    TEST_ASSERT_FALSE(invalid.temp_valid);
+    TEST_ASSERT_FALSE(invalid.main_state_valid);
+    TEST_ASSERT_EQUAL_UINT32(rx + 1, next);
+
+    TEST_ASSERT_FALSE(z906_state_apply_temperature_for_generations(cable, rx, temperatures));
+    TEST_ASSERT_FALSE(z906_state_apply_idle_for_generations(cable, rx, 180));
+    TEST_ASSERT_FALSE(z906_state_apply_input_level_for_generations(cable, rx, 999));
+    z906_state_get(&invalid);
+    TEST_ASSERT_FALSE(invalid.temp_valid);
+    TEST_ASSERT_EQUAL_UINT32(0, invalid.idle_seconds);
+    TEST_ASSERT_EQUAL_UINT32(0, invalid.input_signal_level);
+
+    TEST_ASSERT_TRUE(z906_state_apply_temperature_for_generations(cable, next, temperatures));
+    TEST_ASSERT_TRUE(z906_state_apply_idle_for_generations(cable, next, 180));
+    TEST_ASSERT_TRUE(z906_state_apply_input_level_for_generations(cable, next, 999));
+    z906_state_get(&invalid);
+    TEST_ASSERT_TRUE(invalid.temp_valid);
+    TEST_ASSERT_EQUAL_UINT32(180, invalid.idle_seconds);
+    TEST_ASSERT_EQUAL_UINT32(999, invalid.input_signal_level);
+}
+
 void test_state_defaults(void)
 {
     /* State container struct */
@@ -497,6 +710,14 @@ int runUnityTests(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_state_defaults);
+    RUN_TEST(test_main_status_timestamp_invalidated_on_cable_loss);
+    RUN_TEST(test_main_status_requires_current_cable_epoch);
+    RUN_TEST(test_cable_epoch_confirm_requires_current_connection);
+    RUN_TEST(test_config_atomic_commit_rejects_old_epoch_without_state_changes);
+    RUN_TEST(test_last_amp_rx_drop_invalidates_matched_status_immediately);
+    RUN_TEST(test_standalone_echo_requires_current_cable_and_rx_epochs);
+    RUN_TEST(test_temperature_only_drop_notifies_and_rejects_stale_telemetry);
+    RUN_TEST(test_matched_status_requires_live_query_and_cable);
     RUN_TEST(test_state_volume_boundaries);
     RUN_TEST(test_state_input_transitions);
     RUN_TEST(test_state_telemetry_fields);

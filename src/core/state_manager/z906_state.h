@@ -161,6 +161,20 @@ bool z906_state_set_auto_standby(bool enabled);
  */
 bool z906_state_set_temperature(const int8_t temps[3]);
 
+/** @brief Apply fully decoded amp telemetry only in the current cable and RX
+ *         generations. Check and write share the existing state mutex.
+ * @return true when the packet was accepted, even if values were unchanged.
+ */
+bool z906_state_apply_temperature_for_generations(uint32_t cable_epoch,
+                                                   uint32_t stream_epoch,
+                                                   const int8_t temps[3]);
+bool z906_state_apply_idle_for_generations(uint32_t cable_epoch,
+                                           uint32_t stream_epoch,
+                                           uint32_t seconds);
+bool z906_state_apply_input_level_for_generations(uint32_t cable_epoch,
+                                                  uint32_t stream_epoch,
+                                                  uint32_t level);
+
 /**
  * @brief Updates amplifier idle seconds telemetry.
  * @param seconds Idle seconds.
@@ -181,6 +195,47 @@ bool z906_state_set_input_signal_level(uint32_t level);
  */
 void z906_state_set_cable_status(bool connected);
 
+/** @brief Last observed ADC cable connection generation, independent of EventBus.
+ *         The 32-bit epoch advances on every observed connect/disconnect transition.
+ */
+uint32_t z906_state_get_cable_epoch(void);
+
+/** @brief Shared RX continuity generation, independent of EventBus delivery. */
+uint32_t z906_state_get_amp_rx_stream_epoch(void);
+
+/**
+ * @brief Invalidates confirmed status immediately after an amplifier RX drop.
+ *
+ * Called only by the UART RX owner after a failed amplifier-byte EventBus post;
+ * no subsequent RX byte is required to revoke OTA evidence. When the event
+ * belongs to an earlier cable session, the new session is not invalidated.
+ * @return Current shared RX stream generation.
+ */
+uint32_t z906_state_note_amp_rx_loss(uint32_t expected_cable_epoch);
+
+/** @brief Atomically confirms CONFIG only for the currently connected cable epoch.
+ *         A queued reply from an earlier epoch cannot restore main_state_valid.
+ */
+bool z906_state_confirm_main_for_epoch(uint32_t expected_epoch);
+
+/**
+ * @brief Applies a verified standalone amplifier echo against BOTH physical
+ *        cable and RX-continuity generations, with one state mutex transaction.
+ *        No change or observer notification is emitted for stale epochs.
+ * @return true if recognized and current (even when already at its bound).
+ */
+bool z906_state_apply_amp_echo_for_generations(uint32_t expected_cable_epoch,
+                                               uint32_t expected_rx_stream_epoch,
+                                               uint8_t opcode);
+
+/** @brief Commits the complete, verified CONFIG state atomically only if the
+ *         physical cable epoch still matches. No partial attr updates/observer
+ *         notifications are emitted for stale queued frames.
+ */
+bool z906_state_apply_verified_config_for_epoch(uint32_t expected_epoch,
+                                                uint32_t expected_rx_stream_epoch,
+                                                const z906_state_t *verified);
+
 /**
  * @brief Sets the validity of main control hardware state (power, volume, trims, etc.).
  * @param valid true once first complete status configuration frame is processed.
@@ -192,6 +247,49 @@ void z906_state_set_main_valid(bool valid);
  * @return true if verified status frame received and cable connected, false otherwise.
  */
 bool z906_state_is_main_valid(void);
+
+/**
+ * @brief Monotonic timestamp of the last integrity-verified CONFIG frame.
+ * @return Microseconds from esp_timer_get_time(), or 0 when cable/status is invalid.
+ *         Serialized by the existing state mutex; no dynamic allocations.
+ */
+int64_t z906_state_get_main_status_time_us(void);
+
+/**
+ * @brief Records a status response matched to a live telemetry STATUS request.
+ * Called after verified CONFIG decoding, by the telemetry response owner only.
+ * @param response_time_us Monotonic reception time, or ignored if invalid.
+ */
+void z906_state_note_matched_status_reply(int64_t response_time_us);
+
+/** @brief Returns the last matched live STATUS reply timestamp, or 0 if invalid. */
+int64_t z906_state_get_matched_status_reply_time_us(void);
+
+/** @brief Coherent, single-state-mutex physical OTA proof snapshot. */
+typedef struct {
+    bool main_valid;
+    uint32_t cable_epoch;
+    uint32_t rx_stream_epoch;
+    int64_t matched_status_us;
+} z906_ota_status_snapshot_t;
+
+/** @brief Reads status, timestamp and both generations in one mutex operation. */
+bool z906_state_get_ota_status_snapshot(z906_ota_status_snapshot_t *out);
+
+/**
+ * @brief Serialize an OTA software-admission decision with RX proof invalidation.
+ *
+ * The callback receives a coherent snapshot WHILE the existing state mutex is
+ * held. It must only make a short, non-blocking admission decision; it MUST NOT
+ * call any z906_state API, block, log, or invoke SDK/flash/NVS operations.
+ * Lock ordering is state mutex -> short OTA health portMUX; never inverse.
+ * A cable/RX loss before the decision must either run first or wait until the
+ * decision is complete. Loss after the decision cannot revoke OTA admission.
+ */
+typedef bool (*z906_ota_admission_claim_fn_t)(
+    const z906_ota_status_snapshot_t *locked_proof, void *context);
+bool z906_state_with_locked_ota_snapshot(z906_ota_admission_claim_fn_t claim,
+                                         void *context);
 
 /**
  * @brief Callback type for state change observers.

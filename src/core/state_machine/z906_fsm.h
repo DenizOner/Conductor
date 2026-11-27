@@ -52,7 +52,7 @@ esp_err_t z906_fsm_start(void);
 void z906_fsm_step(TickType_t timeout_ticks);
 
 /**
- * @brief Gets current active FSM state.
+ * @brief Gets the FSM state reconciled with the latest verified physical state.
  */
 z906_fsm_state_t z906_fsm_get_state(void);
 

@@ -13,6 +13,8 @@
 #include "z906_cmd_verifier.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "ota_health.h"
+#include "ota_client.h"
 #include <string.h>
 
 static const char *TAG = "TELEMETRY";
@@ -25,7 +27,13 @@ static telemetry_stat_t s_stats[TELEMETRY_QUERY_COUNT] = { 0 };
 /* Track active pending query and dispatch timestamp */
 static int s_pending_query_id = -1;
 static int64_t s_pending_dispatch_time_us = 0;
+/* No RX can match a query until UART has accepted its command byte. */
+static bool s_pending_tx_committed = false;
+/* Protects query lifecycle shared by telemetry_task, CLI and z906_fsm_task. */
+static portMUX_TYPE s_query_mux = portMUX_INITIALIZER_UNLOCKED;
 #define TELEMETRY_TIMEOUT_US (2000000) /* 2.0 seconds timeout for amplifier response */
+#define OTA_STATUS_POLL_INTERVAL_US (4000000LL) /* Verified CONFIG no older than 5s */
+static int64_t s_last_ota_status_request_us = 0;
 
 static telemetry_query_id_t opcode_to_query_id(uint8_t opcode)
 {
@@ -48,34 +56,70 @@ bool telemetry_dispatch_query(uint8_t query_opcode)
         return false;
     }
 
-    int written = z906_uart_hal_write_amp(&query_opcode, 1);
-    z906_cmd_verifier_unlock();
-
-    if (written == 1) {
-        telemetry_query_id_t qid = opcode_to_query_id(query_opcode);
-        int64_t now = esp_timer_get_time();
-        s_stats[qid].request_count++;
-        s_stats[qid].last_request_time_us = now;
-
+    telemetry_query_id_t qid = opcode_to_query_id(query_opcode);
+    portENTER_CRITICAL(&s_query_mux);
+    bool available = (s_pending_query_id < 0);
+    if (available) {
+        /* Reserve the TX slot, but RX matching stays OFF until a successful
+         * uart_write_bytes return. FSM preemption cannot pre-approve TX. */
         s_pending_query_id = (int)qid;
-        s_pending_dispatch_time_us = now;
-        return true;
+        s_pending_tx_committed = false;
+        s_pending_dispatch_time_us = 0;
+    }
+    portEXIT_CRITICAL(&s_query_mux);
+    if (!available) {
+        z906_cmd_verifier_unlock();
+        return false;
     }
 
-    return false;
+    int written = z906_uart_hal_write_amp(&query_opcode, 1);
+    int64_t committed_us = esp_timer_get_time();
+
+    portENTER_CRITICAL(&s_query_mux);
+    if (written == 1 && s_pending_query_id == (int)qid) {
+        s_pending_dispatch_time_us = committed_us;
+        s_pending_tx_committed = true;
+        s_stats[qid].request_count++;
+        s_stats[qid].last_request_time_us = committed_us;
+    } else if (s_pending_query_id == (int)qid) {
+        s_pending_query_id = -1;
+        s_pending_tx_committed = false;
+        s_pending_dispatch_time_us = 0;
+    }
+    portEXIT_CRITICAL(&s_query_mux);
+    z906_cmd_verifier_unlock();
+    return written == 1;
 }
 
-void telemetry_notify_response_received(telemetry_query_id_t query_id)
+void telemetry_notify_response_received(telemetry_query_id_t query_id,
+                                       int64_t frame_started_at_us)
 {
-    if ((int)query_id >= 0 && query_id < TELEMETRY_QUERY_COUNT) {
-        int64_t now = esp_timer_get_time();
+    if ((int)query_id < 0 || query_id >= TELEMETRY_QUERY_COUNT) {
+        return;
+    }
+
+    int64_t now = esp_timer_get_time();
+    bool matched_status = false;
+    portENTER_CRITICAL(&s_query_mux);
+    /* Unsolicited CONFIG still updates physical state via FSM, but is not
+     * proof that our OTA STATUS query received a timely matching reply. */
+    if (s_pending_query_id == (int)query_id &&
+        s_pending_tx_committed &&
+        frame_started_at_us >= s_pending_dispatch_time_us &&
+        frame_started_at_us <= now &&
+        now >= s_pending_dispatch_time_us &&
+        (now - s_pending_dispatch_time_us) <= TELEMETRY_TIMEOUT_US) {
         s_stats[query_id].success_count++;
         s_stats[query_id].consecutive_failures = 0;
         s_stats[query_id].last_success_time_us = now;
+        s_pending_query_id = -1;
+        s_pending_tx_committed = false;
+        matched_status = (query_id == TELEMETRY_QUERY_STATUS);
+    }
+    portEXIT_CRITICAL(&s_query_mux);
 
-        if (s_pending_query_id == (int)query_id) {
-            s_pending_query_id = -1;
-        }
+    if (matched_status) {
+        z906_state_note_matched_status_reply(now);
     }
 }
 
@@ -84,7 +128,9 @@ bool telemetry_get_stats(telemetry_query_id_t query_id, telemetry_stat_t *out_st
     if ((int)query_id < 0 || query_id >= TELEMETRY_QUERY_COUNT || out_stat == NULL) {
         return false;
     }
+    portENTER_CRITICAL(&s_query_mux);
     *out_stat = s_stats[query_id];
+    portEXIT_CRITICAL(&s_query_mux);
     return true;
 }
 
@@ -97,6 +143,12 @@ void telemetry_process_cycle(void)
         ESP_LOGW(TAG, "Cable presence status changed: %s", cable_now ? "CONNECTED" : "DISCONNECTED");
         s_last_cable_connected = cable_now;
         z906_state_set_cable_status(cable_now);
+        portENTER_CRITICAL(&s_query_mux);
+        s_pending_query_id = -1;
+        s_pending_tx_committed = false;
+        s_pending_dispatch_time_us = 0;
+        portEXIT_CRITICAL(&s_query_mux);
+        s_last_ota_status_request_us = 0;
 
         z906_event_t evt = {
             .type = EVENT_CABLE_STATUS_CHANGED,
@@ -106,26 +158,49 @@ void telemetry_process_cycle(void)
     }
 
     if (!cable_now) {
+        portENTER_CRITICAL(&s_query_mux);
         s_pending_query_id = -1;
+        s_pending_tx_committed = false;
+        portEXIT_CRITICAL(&s_query_mux);
         return;
     }
 
     /* 2. Check for timeout on any pending telemetry query */
     int64_t now = esp_timer_get_time();
-    if (s_pending_query_id >= 0) {
-        if ((now - s_pending_dispatch_time_us) > TELEMETRY_TIMEOUT_US) {
-            telemetry_query_id_t timed_out_id = (telemetry_query_id_t)s_pending_query_id;
-            s_stats[timed_out_id].timeout_count++;
-            s_stats[timed_out_id].consecutive_failures++;
-
-            if (s_stats[timed_out_id].consecutive_failures <= 3 ||
-                s_stats[timed_out_id].consecutive_failures % 10 == 0) {
-                ESP_LOGW(TAG, "Telemetry query %d timed out (consecutive failures: %lu)",
-                         (int)timed_out_id, (unsigned long)s_stats[timed_out_id].consecutive_failures);
-            }
-            s_pending_query_id = -1;
-        }
+    telemetry_query_id_t timed_out_id = TELEMETRY_QUERY_COUNT;
+    uint32_t consecutive_failures = 0;
+    portENTER_CRITICAL(&s_query_mux);
+    if (s_pending_query_id >= 0 && s_pending_tx_committed &&
+        (now - s_pending_dispatch_time_us) > TELEMETRY_TIMEOUT_US) {
+        timed_out_id = (telemetry_query_id_t)s_pending_query_id;
+        s_stats[timed_out_id].timeout_count++;
+        consecutive_failures = ++s_stats[timed_out_id].consecutive_failures;
+        s_pending_query_id = -1;
+        s_pending_tx_committed = false;
     }
+    bool query_available = (s_pending_query_id < 0);
+    portEXIT_CRITICAL(&s_query_mux);
+    if (timed_out_id != TELEMETRY_QUERY_COUNT &&
+        (consecutive_failures <= 3 || consecutive_failures % 10 == 0)) {
+        ESP_LOGW(TAG, "Telemetry query %d timed out (consecutive failures: %lu)",
+                 (int)timed_out_id, (unsigned long)consecutive_failures);
+    }
+
+    /* While pending, poll STATUS approximately every 4 seconds, including AFTER
+     * the first valid CONFIG reply. The OTA health decision requires a recent
+     * response, not a sticky main_state_valid flag from earlier in the window.
+     * Reuse the verifier mutex, never preempt user commands or another query. */
+    if (ota_health_is_pending_verify()) {
+        if (query_available &&
+            (s_last_ota_status_request_us == 0 ||
+             now - s_last_ota_status_request_us >= OTA_STATUS_POLL_INTERVAL_US)) {
+            if (telemetry_dispatch_query(Z906_CMD_READ_STATUS)) {
+                s_last_ota_status_request_us = now;
+            }
+        }
+        return;
+    }
+    s_last_ota_status_request_us = 0;
 
     /* 3. Execute non-interfering sequential telemetry polling every 5 seconds (5 * 1000ms ticks) */
     s_cycle_counter++;
@@ -194,7 +269,6 @@ void telemetry_audit_stack_usage(TaskHandle_t task, const char *task_name)
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "wdt_manager.h"
-#include "ota_health.h"
 
 /** @brief Stack depth in words for the telemetry polling task */
 #define TELEMETRY_TASK_STACK_WORDS    (2048u / sizeof(StackType_t))
@@ -226,24 +300,25 @@ static void prv_telemetry_task(void *pvParameters)
 {
     (void)pvParameters; /* No gate handle — startup handled by private semaphore */
 
-    wdt_manager_register_task();
+    bool twdt_registered = wdt_manager_register_task();
+    if (!twdt_registered) {
+        ESP_LOGE(TAG, "telemetry_task is NOT subscribed to TWDT; OTA health will fail");
+    }
     ESP_LOGI(TAG, "telemetry_task running (Priority %u)", TELEMETRY_TASK_PRIORITY);
 
     /* Signal telemetry_start() that this task is alive and entering its loop */
     xSemaphoreGive(s_started_sem);
 
-    bool twdt_reported = false;
-
     while (1) {
-        wdt_manager_reset();
+        bool twdt_fed = twdt_registered && wdt_manager_reset_checked();
         telemetry_process_cycle();
 
-        /* Report TWDT health to OTA engine once after a successful cycle.
-         * This proves all TWDT-registered tasks are alive and feeding. */
-        if (!twdt_reported) {
-            ota_health_report_twdt_ok();
-            twdt_reported = true;
-        }
+        /* This proves only that THIS task is registered and fed successfully.
+         * It does not claim other TWDT subscribers are healthy. */
+        ota_health_report_twdt_observation(twdt_fed);
+
+        /* Single runtime owner of the pending-image health evaluation. */
+        ota_client_process_cycle();
 
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -279,6 +354,6 @@ bool telemetry_start(void)
     }
 
     ESP_LOGI(TAG, "telemetry_task STARTED (Priority %u, stack %u words)",
-             TELEMETRY_TASK_PRIORITY, TELEMETRY_TASK_STACK_WORDS);
+             TELEMETRY_TASK_PRIORITY, (unsigned int)TELEMETRY_TASK_STACK_WORDS);
     return true;
 }
